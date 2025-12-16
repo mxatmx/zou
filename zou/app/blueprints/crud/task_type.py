@@ -316,6 +316,7 @@ class TaskTypeResource(BaseModelResource):
             400:
               description: Integrity error or cannot delete
         """
+        ScheduleItem.query.filter_by(task_type_id=instance_id).delete()
         return super().delete(instance_id)
 
     def pre_delete(self, instance_dict):
