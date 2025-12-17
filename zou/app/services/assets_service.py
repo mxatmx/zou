@@ -328,6 +328,7 @@ def get_assets_and_tasks(criterions={}, with_episode_ids=False):
                 "casting_episode_ids": cast_in_episode_ids.get(asset_id, []),
                 "is_casting_standby": asset.is_casting_standby,
                 "is_shared": asset.is_shared,
+                "uses_import_workflow": asset.uses_import_workflow,
                 "data": data,
                 "tasks": [],
             }
