@@ -20,6 +20,7 @@ class NewAssetSchema(BaseSchema):
     data: Optional[dict] = Field(default={})
     is_shared: Optional[bool] = False
     episode_id: Optional[UUID] = None
+    uses_import_workflow: Optional[bool] = False
 
 
 class AssetInstanceSchema(BaseSchema):

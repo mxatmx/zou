@@ -968,6 +968,7 @@ class NewAssetResource(Resource, ArgsMixin):
                       description: Last update timestamp
                       example: "2023-01-01T12:30:00Z"
         """
+<<<<<<< HEAD
         body = validation.validate_request_body(NewAssetSchema)
 
         user_service.check_manager_project_access(project_id)
@@ -980,9 +981,9 @@ class NewAssetResource(Resource, ArgsMixin):
             body.is_shared,
             str(body.episode_id) if body.episode_id else None,
             created_by=persons_service.get_current_user()["id"],
+            use_import_workflow=body.uses_import_workflow,
         )
         return asset, 201
-
 
 class AssetCastingResource(Resource):
 
