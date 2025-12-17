@@ -961,7 +961,7 @@ class NewAssetResource(Resource, ArgsMixin):
                       description: Last update timestamp
                       example: "2023-01-01T12:30:00Z"
         """
-        (name, description, data, is_shared, source_id) = self.get_arguments()
+        (name, description, data, is_shared, source_id, uses_import_workflow) = self.get_arguments()
 
         user_service.check_manager_project_access(project_id)
         asset = assets_service.create_asset(
@@ -973,6 +973,7 @@ class NewAssetResource(Resource, ArgsMixin):
             is_shared,
             source_id,
             created_by=persons_service.get_current_user()["id"],
+            use_import_workflow=uses_import_workflow,
         )
         return asset, 201
 
@@ -993,6 +994,12 @@ class NewAssetResource(Resource, ArgsMixin):
                     inputs.boolean,
                 ),
                 "episode_id",
+                (
+                    "uses_import_workflow",
+                    False,
+                    False,
+                    inputs.boolean,
+                ),
             ]
         )
 
@@ -1002,6 +1009,7 @@ class NewAssetResource(Resource, ArgsMixin):
             args["data"],
             args["is_shared"],
             args["episode_id"],
+            args["uses_import_workflow"],
         )
 
 
