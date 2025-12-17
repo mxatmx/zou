@@ -327,6 +327,33 @@ class EntityTypeResource(BaseModelResource):
             "asset-type:delete", {"asset_type_id": instance_dict["id"]}
         )
 
+    def pre_update(self, instance_dict, data):
+        """
+        Handle relationship updates for task_types and import_task_types.
+        These are many-to-many relationships that need special handling.
+        """
+        from zou.app.models.task_type import TaskType
+
+        # Handle task_types relationship
+        if "task_types" in data:
+            task_type_ids = data.pop("task_types", [])
+            self.instance.task_types = []
+            for task_type_id in task_type_ids:
+                task_type = TaskType.get(task_type_id)
+                if task_type is not None:
+                    self.instance.task_types.append(task_type)
+
+        # Handle import_task_types relationship
+        if "import_task_types" in data:
+            import_task_type_ids = data.pop("import_task_types", [])
+            self.instance.import_task_types = []
+            for task_type_id in import_task_type_ids:
+                task_type = TaskType.get(task_type_id)
+                if task_type is not None:
+                    self.instance.import_task_types.append(task_type)
+
+        return data
+
     def post_update(self, instance_dict, data):
         entities_service.clear_entity_type_cache(instance_dict["id"])
         assets_service.clear_asset_type_cache()
