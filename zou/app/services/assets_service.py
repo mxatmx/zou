@@ -596,9 +596,15 @@ def create_asset(
     is_shared=False,
     source_id=None,
     created_by=None,
+    use_import_workflow=False,
 ):
     """
     Create a new asset from given parameters.
+
+    Args:
+        use_import_workflow: If True, uses the asset type's import workflow
+            instead of the standard workflow. Used for imported/licensed assets
+            that don't need full production steps.
     """
     project = projects_service.get_project_raw(project_id)
     asset_type = get_asset_type_raw(asset_type_id)
@@ -613,12 +619,17 @@ def create_asset(
         is_shared=is_shared,
         source_id=source_id,
         created_by=created_by,
+        uses_import_workflow=use_import_workflow,
     )
 
     index_service.index_asset(asset)
     events.emit(
         "asset:new",
-        {"asset_id": asset.id, "asset_type": asset_type.id},
+        {
+            "asset_id": asset.id,
+            "asset_type": asset_type.id,
+            "uses_import_workflow": use_import_workflow,
+        },
         project_id=str(project.id),
     )
 

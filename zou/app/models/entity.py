@@ -102,6 +102,8 @@ class Entity(db.Model, BaseMixin, SerializerMixin):
 
     is_shared = db.Column(db.Boolean, default=False, nullable=False)
 
+    uses_import_workflow = db.Column(db.Boolean, default=False, index=True)
+
     status = db.Column(
         ChoiceType(ENTITY_STATUSES), default="running", nullable=False
     )

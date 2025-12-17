@@ -333,6 +333,9 @@ class EntityTypeResource(BaseModelResource):
         instance_dict["task_types"] = [
             str(task_types.id) for task_types in self.instance.task_types
         ]
+        instance_dict["import_task_types"] = [
+            str(task_types.id) for task_types in self.instance.import_task_types
+        ]
         return instance_dict
 
     def post_delete(self, instance_dict):

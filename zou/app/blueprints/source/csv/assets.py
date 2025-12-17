@@ -278,6 +278,14 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
 
         tasks_update = self.get_tasks_update(row)
 
+        # Check for Import Workflow column
+        use_import_workflow = row.get("Import Workflow", "") or ""
+        uses_import_workflow = use_import_workflow.lower() in (
+            "true", "yes", "1", "y"
+        )
+        if uses_import_workflow:
+            asset_new_values["uses_import_workflow"] = True
+
         if entity is None:
             entity = Entity.create(
                 **{**asset_values, **asset_new_values},
@@ -312,13 +320,24 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
         return entity.serialize()
 
     @cache.memoize_function(10)
-    def get_task_types_for_asset_type(self, asset_type_id):
+    def get_task_types_for_asset_type(
+        self, asset_type_id, uses_import_workflow=False
+    ):
         task_type_ids = [
             str(task_type.id)
             for task_type in self.task_types_in_project_for_assets
         ]
         asset_type = assets_service.get_asset_type(asset_type_id)
-        type_task_type_ids = asset_type["task_types"]
+
+        # Use import_task_types if available and uses_import_workflow is True
+        if uses_import_workflow:
+            type_task_type_ids = asset_type.get("import_task_types", [])
+            if not type_task_type_ids:
+                # Fallback to standard workflow if no import workflow defined
+                type_task_type_ids = asset_type.get("task_types", [])
+        else:
+            type_task_type_ids = asset_type.get("task_types", [])
+
         type_task_types_map = {
             task_type_id: True for task_type_id in type_task_type_ids
         }
@@ -336,8 +355,10 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
             project_id,
         )
         for asset in entities:
+            uses_import_workflow = asset.get("uses_import_workflow", False)
             task_type_ids = self.get_task_types_for_asset_type(
-                asset["entity_type_id"]
+                asset["entity_type_id"],
+                uses_import_workflow=uses_import_workflow,
             )
             for task_type_id in task_type_ids:
                 tasks_service.create_tasks({"id": task_type_id}, [asset])

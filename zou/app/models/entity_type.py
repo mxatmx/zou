@@ -29,6 +29,35 @@ class TaskTypeAssetTypeLink(db.Model):
     )
 
 
+class TaskTypeAssetTypeImportLink(db.Model):
+    """
+    Links task types to asset types for the import workflow.
+    This allows asset types to have a separate, simplified workflow
+    for imported assets that don't need full production steps.
+    """
+
+    asset_type_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("entity_type.id"),
+        index=True,
+        primary_key=True,
+    )
+    task_type_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("task_type.id"),
+        index=True,
+        primary_key=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "asset_type_id",
+            "task_type_id",
+            name="task_type_asset_type_import_link_uc",
+        ),
+    )
+
+
 class EntityType(db.Model, BaseMixin, SerializerMixin):
     """
     Type of entities. It can describe either an asset type, or tell if target
@@ -43,16 +72,24 @@ class EntityType(db.Model, BaseMixin, SerializerMixin):
         secondary=TaskTypeAssetTypeLink.__table__,
         lazy="joined",
     )
+    import_task_types = db.relationship(
+        TaskType,
+        secondary=TaskTypeAssetTypeImportLink.__table__,
+        lazy="joined",
+    )
     archived = db.Column(db.Boolean(), default=False)
 
     @classmethod
     def create_from_import(cls, data):
         is_update = False
         task_types_ids = None
+        import_task_types_ids = None
         if "type" in data:
             del data["type"]
         if "task_types" in data:
             task_types_ids = data.pop("task_types", None)
+        if "import_task_types" in data:
+            import_task_types_ids = data.pop("import_task_types", None)
         entity_type = cls.get(data["id"])
         if entity_type is None:
             entity_type = cls.create(**data)
@@ -66,5 +103,12 @@ class EntityType(db.Model, BaseMixin, SerializerMixin):
                 task_type = TaskType.get(task_type_id)
                 if task_type is not None:
                     entity_type.task_types.append(task_type)
+        if import_task_types_ids is not None:
+            entity_type.import_task_types = []
+            for task_type_id in import_task_types_ids:
+                task_type = TaskType.get(task_type_id)
+                if task_type is not None:
+                    entity_type.import_task_types.append(task_type)
+        if task_types_ids is not None or import_task_types_ids is not None:
             entity_type.save()
         return (entity_type, is_update)
