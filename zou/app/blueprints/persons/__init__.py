@@ -30,6 +30,12 @@ from zou.app.blueprints.persons.resources import (
     ChangePasswordForPersonResource,
     DisableTwoFactorAuthenticationPersonResource,
     ClearAvatarPersonResource,
+    AllPersonSoftwareResource,
+    AddSoftwareToPersonResource,
+    SoftwarePersonResource,
+    AllPersonHardwareItemsResource,
+    AddHardwareItemToPersonResource,
+    HardwareItemPersonResource,
 )
 
 routes = [
@@ -112,7 +118,28 @@ routes = [
         "/actions/persons/<person_id>/clear-avatar",
         ClearAvatarPersonResource,
     ),
+    # Person software license assignments
+    ("/data/persons/software-licenses", AllPersonSoftwareResource),
+    (
+        "/data/persons/<person_id>/software-licenses",
+        AddSoftwareToPersonResource,
+    ),
+    (
+        "/data/persons/<person_id>/software-licenses/<software_id>",
+        SoftwarePersonResource,
+    ),
+    # Person hardware item assignments
+    ("/data/persons/hardware-items", AllPersonHardwareItemsResource),
+    (
+        "/data/persons/<person_id>/hardware-items",
+        AddHardwareItemToPersonResource,
+    ),
+    (
+        "/data/persons/<person_id>/hardware-items/<hardware_item_id>",
+        HardwareItemPersonResource,
+    ),
 ]
 
 blueprint = Blueprint("persons", "persons")
 api = configure_api_from_blueprint(blueprint, routes)
+

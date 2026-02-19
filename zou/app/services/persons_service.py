@@ -13,8 +13,14 @@ from flask_jwt_extended import create_access_token, get_jti, current_user
 
 from zou.app.models.department import Department
 from zou.app.models.desktop_login_log import DesktopLoginLog
+from zou.app.models.hardware_item import HardwareItem
 from zou.app.models.organisation import Organisation
-from zou.app.models.person import Person
+from zou.app.models.person import (
+    Person,
+    SoftwarePersonLink,
+    HardwareItemPersonLink,
+)
+from zou.app.models.software import Software
 from zou.app.models.time_spent import TimeSpent
 
 from zou.app import config, file_store, db
@@ -23,8 +29,10 @@ from zou.app.utils.email_i18n import get_email_translation
 from zou.app.services import index_service, auth_service, templates_service
 from zou.app.stores import auth_tokens_store
 from zou.app.services.exception import (
+    HardwareItemNotFoundException,
     PersonNotFoundException,
     PersonInProtectedAccounts,
+    SoftwareNotFoundException,
     WrongParameterException,
 )
 
@@ -794,3 +802,137 @@ def create_access_token_for_raw_person(person):
     person.jti = get_jti(access_token)
     person.save()
     return access_token
+
+
+def _check_software_exists(software_id):
+    software = Software.get(software_id)
+    if not software:
+        raise SoftwareNotFoundException
+    return software
+
+
+def _check_hardware_item_exists(hardware_item_id):
+    hardware_item = HardwareItem.get(hardware_item_id)
+    if not hardware_item:
+        raise HardwareItemNotFoundException
+    return hardware_item
+
+
+def get_all_software_for_persons():
+    """
+    Get all software items for all persons organized by person
+    in a dictionary where the key is the person id and the value is a
+    list of linked software items.
+    """
+    software_list = (
+        Software.query.join(SoftwarePersonLink)
+        .add_columns(SoftwarePersonLink.person_id)
+        .all()
+    )
+    person_map = {}
+    for software, person_id in software_list:
+        person_id_str = str(person_id)
+        if person_id_str not in person_map:
+            person_map[person_id_str] = []
+        person_map[person_id_str].append(software.serialize())
+    return person_map
+
+
+def get_all_hardware_items_for_persons():
+    """
+    Get all hardware items for all persons organized by person
+    in a dictionary where the key is the person id and the value is a
+    list of linked hardware items.
+    """
+    hardware_item_list = (
+        HardwareItem.query.join(HardwareItemPersonLink)
+        .add_columns(HardwareItemPersonLink.person_id)
+        .all()
+    )
+    person_map = {}
+    for hardware_item, person_id in hardware_item_list:
+        person_id_str = str(person_id)
+        if person_id_str not in person_map:
+            person_map[person_id_str] = []
+        person_map[person_id_str].append(hardware_item.serialize())
+    return person_map
+
+
+def get_software_for_person(person_id):
+    """
+    Get all software items for a given person.
+    """
+    get_person_raw(person_id)
+    return fields.serialize_models(
+        Software.query.join(SoftwarePersonLink)
+        .filter(SoftwarePersonLink.person_id == person_id)
+        .all()
+    )
+
+
+def get_hardware_items_for_person(person_id):
+    """
+    Get all hardware items for a given person.
+    """
+    get_person_raw(person_id)
+    return fields.serialize_models(
+        HardwareItem.query.join(HardwareItemPersonLink)
+        .filter(HardwareItemPersonLink.person_id == person_id)
+        .all()
+    )
+
+
+def add_software_to_person(person_id, software_id):
+    """
+    Add a software item to a person.
+    """
+    get_person_raw(person_id)
+    _check_software_exists(software_id)
+    link = SoftwarePersonLink.get_or_create(
+        person_id=person_id, software_id=software_id
+    )
+    return link.serialize()
+
+
+def remove_software_from_person(person_id, software_id):
+    """
+    Remove a software item from a person.
+    """
+    get_person_raw(person_id)
+    _check_software_exists(software_id)
+    link = SoftwarePersonLink.get_by(
+        person_id=person_id, software_id=software_id
+    )
+    if not link:
+        return None
+    else:
+        link.delete()
+        return link.serialize()
+
+
+def add_hardware_item_to_person(person_id, hardware_item_id):
+    """
+    Add a hardware item to a person.
+    """
+    get_person_raw(person_id)
+    _check_hardware_item_exists(hardware_item_id)
+    link = HardwareItemPersonLink.get_or_create(
+        person_id=person_id, hardware_item_id=hardware_item_id
+    )
+    return link.serialize()
+
+
+def remove_hardware_item_from_person(person_id, hardware_item_id):
+    """
+    Remove a hardware item from a person.
+    """
+    get_person_raw(person_id)
+    _check_hardware_item_exists(hardware_item_id)
+    link = HardwareItemPersonLink.get_by(
+        person_id=person_id, hardware_item_id=hardware_item_id
+    )
+    if not link:
+        return None
+    else:
+        link.delete()
+        return link.serialize()

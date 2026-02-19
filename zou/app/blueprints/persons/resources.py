@@ -1879,3 +1879,398 @@ class ClearAvatarPersonResource(Resource):
         permissions.check_admin_permissions()
         persons_service.clear_avatar(person_id)
         return "", 204
+
+
+class AllPersonSoftwareResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def get(self):
+        """
+        Get all person software licenses
+        ---
+        description: Retrieve all software licenses organized by person.
+          Returns a dictionary where each person contains their associated
+          software licenses.
+        tags:
+          - Persons
+        responses:
+          200:
+            description: Person software licenses successfully retrieved
+            content:
+              application/json:
+                schema:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          description: Software license unique identifier
+                          example: a24a6ea4-ce75-4665-a070-57453082c25
+                        name:
+                          type: string
+                          description: Software license name
+                          example: "Maya"
+                        short_name:
+                          type: string
+                          description: Software license short name
+                          example: "MAYA"
+                        file_extension:
+                          type: string
+                          description: Default file extension for the software license
+                          example: ".ma"
+        """
+        softwares = persons_service.get_all_software_for_persons()
+        return softwares, 200
+
+
+class AddSoftwareToPersonResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def get(self, person_id):
+        """
+        Get person software licenses
+        ---
+        description: Retrieve all software licenses assigned to a specific person.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+        responses:
+          200:
+            description: Person software licenses successfully retrieved
+            content:
+              application/json:
+                schema:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        description: Software license unique identifier
+                        example: a24a6ea4-ce75-4665-a070-57453082c25
+                      name:
+                        type: string
+                        description: Software license name
+                        example: "Maya"
+        """
+        self.check_id_parameter(person_id)
+        softwares = persons_service.get_software_for_person(person_id)
+        return softwares, 200
+
+    @jwt_required()
+    @permissions.require_admin
+    def post(self, person_id):
+        """
+        Add software license to person
+        ---
+        description: Assign a software license to a specific person.
+          This allows tracking which software licenses are assigned to which
+          people in the studio for budget forecasting.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - software_id
+                properties:
+                  software_id:
+                    type: string
+                    format: uuid
+                    description: Software identifier to add to person
+                    example: b35b7fb5-df86-5776-b181-68564193d36
+        responses:
+          201:
+            description: Software license successfully added to person
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                      description: Software person link unique identifier
+                    person_id:
+                      type: string
+                      format: uuid
+                      description: Person identifier
+                    software_id:
+                      type: string
+                      format: uuid
+                      description: Software license identifier
+                    created_at:
+                      type: string
+                      format: date-time
+                      description: Creation timestamp
+        """
+        args = self.get_args(
+            [
+                ("software_id", None, True),
+            ]
+        )
+        self.check_id_parameter(person_id)
+        self.check_id_parameter(args["software_id"])
+        software = persons_service.add_software_to_person(
+            person_id, args["software_id"]
+        )
+        return software, 201
+
+
+class SoftwarePersonResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def delete(self, person_id, software_id):
+        """
+        Remove software license from person
+        ---
+        description: Remove a software license from a specific person.
+          This disassociates the software license from the person.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+          - in: path
+            name: software_id
+            required: true
+            type: string
+            format: uuid
+            example: b35b7fb5-df86-5776-b181-68564193d36
+            description: Unique identifier of the software license to remove
+        responses:
+          204:
+            description: Software license successfully removed from person
+        """
+        self.check_id_parameter(person_id)
+        self.check_id_parameter(software_id)
+        persons_service.remove_software_from_person(person_id, software_id)
+        return "", 204
+
+
+class AllPersonHardwareItemsResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def get(self):
+        """
+        Get all person hardware items
+        ---
+        description: Retrieve all hardware items organized by person.
+          Returns a dictionary where each person contains their associated
+          hardware items.
+        tags:
+          - Persons
+        responses:
+          200:
+            description: Person hardware items successfully retrieved
+            content:
+              application/json:
+                schema:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                          description: Hardware item unique identifier
+                          example: a24a6ea4-ce75-4665-a070-57453082c25
+                        name:
+                          type: string
+                          description: Hardware item name
+                          example: "Workstation"
+                        short_name:
+                          type: string
+                          description: Hardware item short name
+                          example: "WS"
+        """
+        hardware_items = persons_service.get_all_hardware_items_for_persons()
+        return hardware_items, 200
+
+
+class AddHardwareItemToPersonResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def get(self, person_id):
+        """
+        Get person hardware items
+        ---
+        description: Retrieve all hardware items assigned to a specific person.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+        responses:
+          200:
+            description: Person hardware items successfully retrieved
+            content:
+              application/json:
+                schema:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        format: uuid
+                        description: Hardware item unique identifier
+                        example: a24a6ea4-ce75-4665-a070-57453082c25
+                      name:
+                        type: string
+                        description: Hardware item name
+                        example: "Workstation"
+        """
+        self.check_id_parameter(person_id)
+        hardware_items = persons_service.get_hardware_items_for_person(person_id)
+        return hardware_items, 200
+
+    @jwt_required()
+    @permissions.require_admin
+    def post(self, person_id):
+        """
+        Add hardware item to person
+        ---
+        description: Assign a hardware item to a specific person.
+          This allows tracking which hardware items are assigned to which
+          people in the studio for budget forecasting.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - hardware_item_id
+                properties:
+                  hardware_item_id:
+                    type: string
+                    format: uuid
+                    description: Hardware item identifier to add to person
+                    example: b35b7fb5-df86-5776-b181-68564193d36
+        responses:
+          201:
+            description: Hardware item successfully added to person
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                      description: Hardware person link unique identifier
+                    person_id:
+                      type: string
+                      format: uuid
+                      description: Person identifier
+                    hardware_item_id:
+                      type: string
+                      format: uuid
+                      description: Hardware item identifier
+                    created_at:
+                      type: string
+                      format: date-time
+                      description: Creation timestamp
+        """
+        args = self.get_args(
+            [
+                ("hardware_item_id", None, True),
+            ]
+        )
+        self.check_id_parameter(person_id)
+        self.check_id_parameter(args["hardware_item_id"])
+        hardware_item_link = persons_service.add_hardware_item_to_person(
+            person_id, args["hardware_item_id"]
+        )
+        return hardware_item_link, 201
+
+
+class HardwareItemPersonResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    @permissions.require_admin
+    def delete(self, person_id, hardware_item_id):
+        """
+        Remove hardware item from person
+        ---
+        description: Remove a hardware item from a specific person.
+          This disassociates the hardware item from the person.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the person
+          - in: path
+            name: hardware_item_id
+            required: true
+            type: string
+            format: uuid
+            example: b35b7fb5-df86-5776-b181-68564193d36
+            description: Unique identifier of the hardware item to remove
+        responses:
+          204:
+            description: Hardware item successfully removed from person
+        """
+        self.check_id_parameter(person_id)
+        self.check_id_parameter(hardware_item_id)
+        persons_service.remove_hardware_item_from_person(
+            person_id, hardware_item_id
+        )
+        return "", 204
+
