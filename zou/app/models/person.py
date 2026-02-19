@@ -139,6 +139,7 @@ class HardwareItemPersonLink(db.Model, BaseMixin, SerializerMixin):
     )
 
 
+class Person(db.Model, BaseMixin, SerializerMixin):
     """
     Describe a member of the studio (and an API user).
     """
