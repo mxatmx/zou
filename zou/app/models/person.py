@@ -79,7 +79,66 @@ class DepartmentLink(db.Model):
     )
 
 
-class Person(db.Model, BaseMixin, SerializerMixin):
+class SoftwarePersonLink(db.Model, BaseMixin, SerializerMixin):
+    """
+    Uses a many-to-many relationship to link software with persons.
+    It can be used to track which software licenses are assigned to which
+    people in the studio for budget forecasting.
+    """
+
+    __tablename__ = "software_person_link"
+    person_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("person.id"),
+        primary_key=True,
+        index=True,
+    )
+    software_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("software.id"),
+        primary_key=True,
+        index=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "person_id",
+            "software_id",
+            name="software_person_link_uc",
+        ),
+    )
+
+
+class HardwareItemPersonLink(db.Model, BaseMixin, SerializerMixin):
+    """
+    Uses a many-to-many relationship to link hardware items with persons.
+    It can be used to track which hardware items are assigned to which
+    people in the studio for budget forecasting.
+    """
+
+    __tablename__ = "hardware_item_person_link"
+    person_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("person.id"),
+        primary_key=True,
+        index=True,
+    )
+    hardware_item_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("hardware_item.id"),
+        primary_key=True,
+        index=True,
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "person_id",
+            "hardware_item_id",
+            name="hardware_item_person_link_uc",
+        ),
+    )
+
+
     """
     Describe a member of the studio (and an API user).
     """
