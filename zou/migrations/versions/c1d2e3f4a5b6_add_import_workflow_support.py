@@ -1,7 +1,7 @@
 """Add import workflow support for assets
 
-Revision ID: a1b2c3d4e5f6
-Revises: 20a8ad264659
+Revision ID: c1d2e3f4a5b6
+Revises: a0f668430352
 Create Date: 2025-01-27 00:00:00.000000
 
 This migration adds support for the import workflow feature which allows
@@ -20,8 +20,8 @@ from sqlalchemy_utils import UUIDType
 
 
 # revision identifiers, used by Alembic.
-revision = "a1b2c3d4e5f6"
-down_revision = "20a8ad264659"
+revision = "c1d2e3f4a5b6"
+down_revision = "a0f668430352"
 branch_labels = None
 depends_on = None
 
