@@ -464,6 +464,7 @@ class ConfigResource(Resource):
             "is_self_hosted": config.IS_SELF_HOSTED,
             "crisp_token": config.CRISP_TOKEN,
             "dark_theme_by_default": organisation["dark_theme_by_default"],
+            "default_theme": organisation.get("default_theme", "light"),
             "indexer_configured": config.INDEXER["key"] is not None,
             "saml_enabled": config.SAML_ENABLED,
             "saml_idp_name": config.SAML_IDP_NAME,
