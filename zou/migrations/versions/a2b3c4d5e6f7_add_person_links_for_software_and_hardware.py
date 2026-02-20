@@ -1,7 +1,7 @@
 """add person links tables for software and hardware
 
 Revision ID: a2b3c4d5e6f7
-Revises: dde6be40f54f
+Revises: c1d2e3f4a5b6
 Create Date: 2026-01-29 14:45:00.000000
 
 """
@@ -13,7 +13,7 @@ import uuid
 
 # revision identifiers, used by Alembic.
 revision = "a2b3c4d5e6f7"
-down_revision = "dde6be40f54f"
+down_revision = "c1d2e3f4a5b6"
 branch_labels = None
 depends_on = None
 
