@@ -19,6 +19,7 @@ class Organisation(db.Model, BaseMixin, SerializerMixin):
     chat_webhook_mattermost = db.Column(db.String(80), default="")
     chat_token_discord = db.Column(db.String(80), default="")
     dark_theme_by_default = db.Column(db.Boolean(), default=False)
+    default_theme = db.Column(db.String(40), default="light")
     format_duration_in_hours = db.Column(db.Boolean(), default=False)
 
     def present(self, sensitive=False):

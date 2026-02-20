@@ -211,6 +211,7 @@ class Person(db.Model, BaseMixin, SerializerMixin):
 
     is_generated_from_ldap = db.Column(db.Boolean(), default=False)
     ldap_uid = db.Column(db.String(60), unique=True, default=None)
+    theme = db.Column(db.String(40), default="light")
 
     __table_args__ = (
         Index(
