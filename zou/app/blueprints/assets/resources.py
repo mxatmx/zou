@@ -968,7 +968,6 @@ class NewAssetResource(Resource, ArgsMixin):
                       description: Last update timestamp
                       example: "2023-01-01T12:30:00Z"
         """
-<<<<<<< HEAD
         body = validation.validate_request_body(NewAssetSchema)
 
         user_service.check_manager_project_access(project_id)
