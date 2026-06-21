@@ -6,7 +6,7 @@ removed together with it. The foreign key is recreated with ON DELETE CASCADE
 to replace the default RESTRICT behaviour that blocked department deletion.
 
 Revision ID: d1e2f3a4b5c6
-Revises: a2b3c4d5e6f7
+Revises: d4e5f6a7b8c9
 Create Date: 2026-06-21 10:00:00.000000
 
 """
@@ -16,7 +16,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "d1e2f3a4b5c6"
-down_revision = "a2b3c4d5e6f7"
+down_revision = "d4e5f6a7b8c9"
 branch_labels = None
 depends_on = None
 
