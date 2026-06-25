@@ -14,7 +14,6 @@ import uuid
 from zou.app.models.person import ROLE_TYPES
 from zou.app.models.project import PROJECT_STYLES
 
-
 # revision identifiers, used by Alembic.
 revision = "7c91a4b3d2e0"
 down_revision = "68bae7fcd569"
@@ -113,7 +112,9 @@ def upgrade():
         "project_template_task_type_link", schema=None
     ) as batch_op:
         batch_op.create_index(
-            batch_op.f("ix_project_template_task_type_link_project_template_id"),
+            batch_op.f(
+                "ix_project_template_task_type_link_project_template_id"
+            ),
             ["project_template_id"],
             unique=False,
         )
@@ -228,9 +229,7 @@ def upgrade():
         sa.ForeignKeyConstraint(
             ["status_automation_id"], ["status_automation.id"]
         ),
-        sa.PrimaryKeyConstraint(
-            "project_template_id", "status_automation_id"
-        ),
+        sa.PrimaryKeyConstraint("project_template_id", "status_automation_id"),
     )
     with op.batch_alter_table(
         "project_template_status_automation_link", schema=None

@@ -56,11 +56,17 @@ logger = logging.getLogger(__name__)
 # Page size for playlist list endpoints
 PLAYLISTS_PAGE_SIZE = 20
 
+# Whitelist of accepted Playlist.for_entity values. The column itself is a
+# permissive String(10) for historical reasons; this set is what consumers
+# (gazu Literal, kitsu UI branches, docs) actually handle. Validate at the
+# CRUD boundary so a stray value cannot land in storage.
+VALID_FOR_ENTITY_VALUES = ("shot", "asset", "sequence", "edit", "episode")
+
 # First entry's preview_file_id for list rows (PostgreSQL jsonb path), avoids
 # loading the full `shots` column when paired with defer(Playlist.shots).
-_FIRST_SHOT_PREVIEW_FILE_ID_SQL = Playlist.shots[0]["preview_file_id"].astext.label(
-    "first_preview_file_id"
-)
+_FIRST_SHOT_PREVIEW_FILE_ID_SQL = Playlist.shots[0][
+    "preview_file_id"
+].astext.label("first_preview_file_id")
 
 # Sentinel: build_playlist_dict() should read shots on the model (tests / legacy).
 _FIRST_PREVIEW_FILE_ID_FROM_QUERY_UNSET = object()
@@ -82,7 +88,9 @@ _PLAYLIST_LIST_ATTRS = (
 
 
 def _apply_playlist_pagination(query, page, sort_by, model=Playlist):
-    """Apply sort, normalize page, and apply limit/offset to the query."""
+    """
+    Apply sort, normalize page, and apply limit/offset to the query.
+    """
     query = query_utils.apply_sort_by(model, query, sort_by)
     if page < 1:
         page = 1
@@ -114,7 +122,9 @@ def all_playlists_for_project(
     )
     for playlist, first_preview_file_id in query.all():
         result.append(
-            build_playlist_dict(playlist, first_preview_file_id=first_preview_file_id)
+            build_playlist_dict(
+                playlist, first_preview_file_id=first_preview_file_id
+            )
         )
     return result
 
@@ -161,7 +171,9 @@ def all_playlists_for_episode(
     )
     for playlist, first_preview_file_id in query.all():
         result.append(
-            build_playlist_dict(playlist, first_preview_file_id=first_preview_file_id)
+            build_playlist_dict(
+                playlist, first_preview_file_id=first_preview_file_id
+            )
         )
     return result
 
@@ -194,17 +206,26 @@ def build_playlist_dict(
 
 
 def get_first_shot_preview_file_id(playlist):
-    """Return the first shot's preview_file_id if any, else None."""
+    """
+    Return the first shot's preview_file_id if any, else None.
+    """
     if not playlist.shots or not isinstance(playlist.shots, list):
         return None
     first = playlist.shots[0]
     return first.get("preview_file_id") if isinstance(first, dict) else None
 
 
-def get_playlist_with_preview_file_revisions(playlist_id):
+def get_playlist_with_preview_file_revisions(
+    playlist_id, with_annotations=True
+):
     """
     Return given playlist. Shot list is augmented with all previews available
     for a given shot.
+
+    When with_annotations is False, annotation blobs are omitted from the
+    response: they are the heaviest part of a playlist and the web client
+    loads them on demand. Callers that have no lazy-loading (e.g. the shared
+    guest player) keep the default and receive annotations inline.
     """
     # Eager load build_jobs to avoid N+1 when building build_jobs list
     playlist = (
@@ -222,7 +243,7 @@ def get_playlist_with_preview_file_revisions(playlist_id):
     if playlist_dict["shots"] is None:
         playlist_dict["shots"] = []
     playlist_dict, preview_file_map = set_preview_files_for_entities(
-        playlist_dict
+        playlist_dict, with_annotations=with_annotations
     )
 
     for shot in playlist_dict["shots"]:
@@ -236,11 +257,14 @@ def get_playlist_with_preview_file_revisions(playlist_id):
                 shot["preview_file_height"] = preview_file["height"]
                 shot["preview_file_duration"] = preview_file["duration"]
                 shot["preview_file_status"] = preview_file["status"]
-                shot["preview_file_annotations"] = preview_file["annotations"]
                 shot["preview_file_task_id"] = preview_file["task_id"]
                 shot["preview_file_previews"] = preview_file.get(
                     "previews", []
                 )
+                if with_annotations:
+                    shot["preview_file_annotations"] = preview_file.get(
+                        "annotations"
+                    )
             else:
                 del shot["preview_file_id"]
         except Exception as e:
@@ -259,25 +283,51 @@ def _add_build_job_infos_to_playlist_dict(playlist, playlist_dict):
     return playlist_dict
 
 
-def set_preview_files_for_entities(playlist_dict):
+def set_preview_files_for_entities(playlist_dict, with_annotations=True):
     """
     Retrieve all preview files related to entities listed in given playlist.
     Add to each entity a dict with task as keys and preview list as values.
+
+    Annotation blobs are included only when with_annotations is True; the web
+    client opts out and loads them on demand to keep the payload light.
     """
     entity_ids = []
     for entity in playlist_dict["shots"]:
-        if "id" not in entity:
-            entity_id = entity.get("shot_id", entity.get("entity_id", None))
-            if entity_id is not None:
-                entity_ids.append(entity_id)
-                entity["id"] = entity_id
-        else:
-            entity_ids.append(entity["id"])
+        entity_id = (
+            entity.get("id")
+            or entity.get("shot_id")
+            or entity.get("entity_id")
+        )
+        if entity_id:
+            entity_ids.append(entity_id)
+            entity.setdefault("id", entity_id)
     previews = {}
     preview_file_map = {}
 
-    preview_files = (
-        PreviewFile.query.join(Task)
+    # Select scalar columns instead of full PreviewFile ORM objects: a playlist
+    # can hold thousands of revisions, and hydrating that many ORM instances
+    # was the bulk of the query time. We also skip the heavy JSONB blobs `data`
+    # (never used) and `annotations` (only when the caller asked for them). This
+    # mirrors get_preview_files_for_entity().
+    preview_columns = [
+        PreviewFile.id,
+        PreviewFile.revision,
+        PreviewFile.extension,
+        PreviewFile.width,
+        PreviewFile.height,
+        PreviewFile.duration,
+        PreviewFile.status,
+        PreviewFile.created_at,
+        PreviewFile.task_id,
+        Task.task_type_id,
+        Task.entity_id,
+    ]
+    if with_annotations:
+        preview_columns.append(PreviewFile.annotations)
+
+    preview_rows = (
+        PreviewFile.query.with_entities(*preview_columns)
+        .join(Task)
         .join(TaskType)
         .filter(Task.entity_id.in_(entity_ids))
         .order_by(TaskType.priority.desc())
@@ -285,35 +335,33 @@ def set_preview_files_for_entities(playlist_dict):
         .order_by(PreviewFile.revision.desc())
         .order_by(PreviewFile.position)
         .order_by(PreviewFile.created_at)
-        .add_column(Task.task_type_id)
-        .add_column(Task.entity_id)
         .all()
     )
 
-    for preview_file, task_type_id, entity_id in preview_files:
-        entity_id = str(entity_id)
-        task_type_id = str(task_type_id)
+    for row in preview_rows:
+        entity_id = str(row.entity_id)
+        task_type_id = str(row.task_type_id)
         if entity_id not in previews:
             previews[entity_id] = {}
 
         if task_type_id not in previews[entity_id]:
             previews[entity_id][task_type_id] = []
 
-        task_id = str(preview_file.task_id)
-        preview_file_id = str(preview_file.id)
+        preview_file_id = str(row.id)
 
         light_preview_file = {
             "id": preview_file_id,
-            "revision": preview_file.revision,
-            "extension": preview_file.extension,
-            "width": preview_file.width,
-            "height": preview_file.height,
-            "duration": float(preview_file.duration or 0),
-            "status": str(preview_file.status),
-            "annotations": preview_file.annotations,
-            "created_at": fields.serialize_value(preview_file.created_at),
-            "task_id": task_id,
+            "revision": row.revision,
+            "extension": row.extension,
+            "width": row.width,
+            "height": row.height,
+            "duration": float(row.duration or 0),
+            "status": str(row.status),
+            "created_at": fields.serialize_value(row.created_at),
+            "task_id": str(row.task_id),
         }  # Do not add too much field to avoid building too big responses
+        if with_annotations:
+            light_preview_file["annotations"] = row.annotations
         previews[entity_id][task_type_id].append(light_preview_file)
         preview_file_map[preview_file_id] = light_preview_file
 
@@ -324,12 +372,18 @@ def set_preview_files_for_entities(playlist_dict):
             )
 
     for entity in playlist_dict["shots"]:
-        if str(entity["id"]) in previews:
-            entity["preview_files"] = previews[str(entity["id"])]
+        entity_id = entity.get("id")
+        if entity_id and str(entity_id) in previews:
+            entity["preview_files"] = previews[str(entity_id)]
         else:
             entity["preview_files"] = []
 
-    return (fields.serialize_value(playlist_dict), preview_file_map)
+    # playlist_dict is already JSON-safe here: top-level fields and shots came
+    # through playlist.serialize(), build_jobs through BuildJob.present(), and
+    # every preview file dict is built with serialized values. A second
+    # serialize_value() pass over the whole (large) structure would just walk
+    # and copy it again for nothing.
+    return (playlist_dict, preview_file_map)
 
 
 def get_preview_files_for_entity(entity_id):
@@ -617,8 +671,7 @@ def retrieve_playlist_tmp_file(preview_file):
     else:
         file_path = os.path.join(
             config.TMP_DIR,
-            "cache-previews-%s.%s"
-            % (preview_file["id"], preview_file["extension"]),
+            f"cache-previews-{preview_file['id']}.{preview_file['extension']}",
         )
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             if exists_func(prefix, preview_file["id"]):
@@ -705,7 +758,7 @@ def build_playlist_movie_file(playlist, job, shots, params, full, remote):
             job = end_build_job(playlist, job, success)
 
     if not success:
-        raise Exception("Failure while building playlist %r" % playlist["id"])
+        raise Exception(f"Failure while building playlist {playlist['id']!r}")
 
     return job
 
@@ -826,11 +879,9 @@ def build_playlist_job(playlist, job, shots, params, email, full, remote):
     if job["status"] == "succeeded":
         person = persons_service.get_person_by_email_raw(email)
         organisation = persons_service.get_organisation()
-        playlist_url = "%s://%s/api/data/playlists/%s/jobs/%s/build/mp4" % (
-            config.DOMAIN_PROTOCOL,
-            config.DOMAIN_NAME,
-            playlist["id"],
-            job["id"],
+        playlist_url = (
+            f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
+            f"/api/data/playlists/{playlist['id']}/jobs/{job['id']}/build/mp4"
         )
         html = f"""<p>Hello {person.first_name},</p>
 <p>Your playlist {playlist["name"]} build is available:
@@ -861,7 +912,7 @@ def get_playlist_download_context_name(project, playlist):
             episode_name = "all assets"
         else:
             episode_name = "main pack"
-        context_name += "_%s" % slugify(episode_name, separator="_")
+        context_name += f"_{slugify(episode_name, separator='_')}"
     return context_name
 
 
@@ -870,10 +921,7 @@ def get_playlist_file_name(playlist):
     Build file name for the movie file matching given playlist.
     """
     project = projects_service.get_project(playlist["project_id"])
-    download_name = "%s_%s" % (
-        slugify(project["name"]),
-        slugify(playlist["name"]),
-    )
+    download_name = f"{slugify(project['name'])}_{slugify(playlist['name'])}"
     return slugify(download_name)
 
 
@@ -881,7 +929,7 @@ def get_playlist_movie_file_path(build_job):
     """
     Build file path for the movie file matching given playlist.
     """
-    movie_file_name = "cache-playlists-%s.mp4" % build_job["id"]
+    movie_file_name = f"cache-playlists-{build_job['id']}.mp4"
     return os.path.join(config.TMP_DIR, movie_file_name)
 
 
@@ -889,7 +937,7 @@ def get_playlist_zip_file_path(playlist):
     """
     Build file path for the archive file matching given playlist.
     """
-    zip_file_name = "%s.zip" % playlist["id"]
+    zip_file_name = f"{playlist['id']}.zip"
     return os.path.join(config.TMP_DIR, zip_file_name)
 
 
@@ -949,7 +997,7 @@ def _remove_build_job_impl(playlist, job_dict):
             file_store.remove_movie("playlists", build_job_id)
         except Exception:
             current_app.logger.error(
-                "Playlist file can't be deleted: %s" % build_job_id
+                f"Playlist file can't be deleted: {build_job_id}"
             )
     job = BuildJob.get(build_job_id)
     if job is not None:

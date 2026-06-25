@@ -40,6 +40,7 @@ from zou.app.blueprints.auth.schemas import (
     FidoUnregisterSchema,
 )
 from zou.app.utils.email_i18n import get_email_translation
+from zou.app.models.person import normalize_country
 from zou.app.services import (
     persons_service,
     auth_service,
@@ -95,7 +96,7 @@ def _build_2fa_registration_response(response_data, user_id):
         set_refresh_cookies(response, refresh_token)
 
     current_app.logger.info(
-        "2FA setup completed, JWT refreshed for user %s." % user_id
+        f"2FA setup completed, JWT refreshed for user {user_id}."
     )
     return response
 
@@ -239,10 +240,10 @@ class LoginResource(Resource, ArgsMixin):
             if auth_service.is_default_password(app, password):
                 token = auth_service.generate_reset_token()
                 auth_tokens_store.add(
-                    "reset-token-%s" % email, token, ttl=3600 * 2
+                    f"reset-token-{email}", token, ttl=3600 * 2
                 )
                 current_app.logger.info(
-                    "User %s must change his password." % email
+                    f"User {email} must change his password."
                 )
                 return (
                     {
@@ -286,6 +287,12 @@ class LoginResource(Resource, ArgsMixin):
             organisation = persons_service.get_organisation(
                 sensitive=user["role"] == "admin"
             )
+
+            # check_auth() serializes the person without relations, so add
+            # departments to reach parity with /auth/authenticated.
+            user["departments"] = persons_service.get_person(user["id"])[
+                "departments"
+            ]
 
             response_data = {
                 "user": user,
@@ -588,7 +595,7 @@ class ChangePasswordResource(Resource, ArgsMixin):
             password = auth.encrypt_password(body.password)
             persons_service.update_password(user["email"], password)
             current_app.logger.info(
-                "User %s has changed his password" % user["email"]
+                f"User {user['email']} has changed his password"
             )
             organisation = persons_service.get_organisation()
             locale = user.get("locale") or getattr(
@@ -697,7 +704,7 @@ class ResetPasswordResource(Resource, ArgsMixin):
 
         try:
             token_from_store = auth_tokens_store.get(
-                "reset-token-%s" % body.email
+                f"reset-token-{body.email}"
             )
             if token_from_store and hmac.compare_digest(
                 token_from_store, body.token
@@ -705,9 +712,9 @@ class ResetPasswordResource(Resource, ArgsMixin):
                 auth.validate_password(body.password, body.password2)
                 password = auth.encrypt_password(body.password)
                 persons_service.update_password(body.email, password)
-                auth_tokens_store.delete("reset-token-%s" % body.email)
+                auth_tokens_store.delete(f"reset-token-{body.email}")
                 current_app.logger.info(
-                    "User %s has reset his password" % body.email
+                    f"User {body.email} has reset his password"
                 )
                 return {"success": True}
             else:
@@ -773,15 +780,12 @@ class ResetPasswordResource(Resource, ArgsMixin):
             )
 
         token = auth_service.generate_reset_token()
-        auth_tokens_store.add(
-            "reset-token-%s" % body.email, token, ttl=3600 * 2
-        )
+        auth_tokens_store.add(f"reset-token-{body.email}", token, ttl=3600 * 2)
         params = {"email": body.email, "token": token}
         query = urllib.parse.urlencode(params)
-        reset_url = "%s://%s/reset-change-password?%s" % (
-            config.DOMAIN_PROTOCOL,
-            config.DOMAIN_NAME,
-            query,
+        reset_url = (
+            f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
+            f"/reset-change-password?{query}"
         )
         locale = user.get("locale") or getattr(
             config, "DEFAULT_LOCALE", "en_US"
@@ -1468,7 +1472,8 @@ class SAMLSSOResource(Resource, ArgsMixin):
         person_info = {
             k: (
                 " ".join(v)
-                if isinstance(v, list) and k in ["first_name", "last_name"]
+                if isinstance(v, list)
+                and k in ["first_name", "last_name", "country"]
                 else v
             )
             for k, v in authn_response.ava.items()
@@ -1479,8 +1484,20 @@ class SAMLSSOResource(Resource, ArgsMixin):
                 "phone",
                 "departments",
                 "studio_id",
+                "country",
             ]
         }
+        # Align the country with its stored canonical form so an unchanged
+        # value does not re-trigger an update on every login. An empty value
+        # clears the stored country (the IdP is authoritative), but a
+        # malformed value is dropped so a transient bad assertion neither
+        # wipes a previously stored valid code nor breaks the SSO sign-in.
+        if "country" in person_info:
+            is_valid, normalized = normalize_country(person_info["country"])
+            if is_valid:
+                person_info["country"] = normalized
+            else:
+                del person_info["country"]
         try:
             user = persons_service.get_person_by_email(email)
             for k, v in person_info.items():
@@ -1614,7 +1631,11 @@ class OIDCCallbackResource(Resource, ArgsMixin):
         if not config.OIDC_ENABLED:
             return {"error": "OIDC is not enabled."}, 400
 
-        token = oidc.get_oidc_client().authorize_access_token()
+        try:
+            token = oidc.get_oidc_client().authorize_access_token()
+        except Exception:
+            current_app.logger.exception("OIDC token exchange failed.")
+            return {"error": "OIDC authentication failed."}, 400
         claims = token.get("userinfo") or {}
 
         email = oidc.get_email_from_claims(claims)
@@ -1622,6 +1643,19 @@ class OIDCCallbackResource(Resource, ArgsMixin):
             return {"error": "No email claim returned by the provider."}, 400
         if not oidc.is_email_verified(claims):
             return {"error": "Email address is not verified."}, 400
+
+        # Some providers (notably Azure AD/Entra ID) omit name claims from the
+        # ID token and only expose them on the userinfo endpoint. Fetch it as a
+        # best-effort fallback when the token carried no usable name claims; a
+        # failure here must not block an otherwise valid login.
+        if not oidc.map_claims(claims):
+            try:
+                userinfo = oidc.get_oidc_client().userinfo(token=token)
+                claims = {**userinfo, **claims}
+            except Exception:
+                current_app.logger.exception(
+                    "OIDC userinfo fetch failed; proceeding without it."
+                )
 
         person_info = oidc.map_claims(claims)
 

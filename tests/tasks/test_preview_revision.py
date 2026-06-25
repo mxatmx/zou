@@ -30,7 +30,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         self.wip_status_id = str(self.task_status_wip.id)
 
     def create_comment(self):
-        """Create a comment on the task and return it."""
+        """
+        Create a comment on the task and return it.
+        """
         path = f"/actions/tasks/{self.task_id}/comment/"
         data = {
             "task_status_id": self.wip_status_id,
@@ -39,7 +41,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         return self.post(path, data)
 
     def add_preview(self, comment_id, revision=None):
-        """Add a preview to comment. Returns preview_file dict."""
+        """
+        Add a preview to comment. Returns preview_file dict.
+        """
         path = (
             f"/actions/tasks/{self.task_id}/comments/{comment_id}/add-preview"
         )
@@ -47,12 +51,16 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         return self.post(path, data)
 
     def add_extra_preview(self, comment_id, preview_file_id):
-        """Add an extra preview to comment."""
+        """
+        Add an extra preview to comment.
+        """
         path = f"/actions/tasks/{self.task_id}/comments/{comment_id}/preview-files/{preview_file_id}"
         return self.post(path, {})
 
     def test_duplicate_revision_rejected(self):
-        """Creating a new main preview with existing revision should fail."""
+        """
+        Creating a new main preview with existing revision should fail.
+        """
         # Create first comment with revision 1
         comment1 = self.create_comment()
         preview1 = self.add_preview(comment1["id"], revision=1)
@@ -62,10 +70,17 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         comment2 = self.create_comment()
         path = f"/actions/tasks/{self.task_id}/comments/{comment2['id']}/add-preview"
         response = self.post(path, {"revision": 1}, code=400)
-        self.assertIn("already exists", response.get("message", ""))
+        message = response.get("message", "")
+        self.assertIn("already exists", message)
+        # The message must tell the user how to resolve the conflict and
+        # must not be mislabelled as a normalization problem.
+        self.assertIn("auto-increment", message)
+        self.assertNotIn("ormaliz", message)
 
     def test_extra_preview_same_revision_allowed(self):
-        """Extra previews should be allowed to share the same revision."""
+        """
+        Extra previews should be allowed to share the same revision.
+        """
         comment = self.create_comment()
 
         # Create main preview with revision 1
@@ -79,7 +94,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         self.assertEqual(preview2["position"], 2)
 
     def test_update_revision_to_existing_rejected(self):
-        """Updating a main preview to an existing revision should fail."""
+        """
+        Updating a main preview to an existing revision should fail.
+        """
         # Create two comments with different revisions
         comment1 = self.create_comment()
         preview1 = self.add_preview(comment1["id"], revision=1)
@@ -93,7 +110,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         self.assertIn("already exists", response.get("message", ""))
 
     def test_update_revision_propagates_to_extras(self):
-        """Updating main preview revision should propagate to extra previews."""
+        """
+        Updating main preview revision should propagate to extra previews.
+        """
         comment = self.create_comment()
 
         # Create main preview with revision 1
@@ -116,7 +135,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         self.assertEqual(extra_preview.revision, 5)
 
     def test_check_revision_is_unique_service(self):
-        """Direct test of check_revision_is_unique_for_task service function."""
+        """
+        Direct test of check_revision_is_unique_for_task service function.
+        """
         # Create a preview with revision 1
         self.generate_fixture_preview_file(revision=1, position=1)
 
@@ -132,7 +153,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         )
 
     def test_check_revision_exclude_self(self):
-        """Check should exclude the preview being updated."""
+        """
+        Check should exclude the preview being updated.
+        """
         preview = self.generate_fixture_preview_file(revision=1, position=1)
 
         # Should not raise when excluding the preview itself
@@ -143,7 +166,9 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         )
 
     def test_check_ignores_extra_previews(self):
-        """Check should only consider main previews (position 1)."""
+        """
+        Check should only consider main previews (position 1).
+        """
         # Create extra preview (position 2) with revision 1
         self.generate_fixture_preview_file(revision=1, position=2)
 
@@ -151,3 +176,79 @@ class PreviewRevisionTestCase(ApiDBTestCase):
         tasks_service.check_revision_is_unique_for_task(
             str(self.task.id), revision=1
         )
+
+    def enable_single_preview(self):
+        """
+        Turn on the single-preview-per-revision option on the project.
+        """
+        from zou.app.services import projects_service
+
+        projects_service.update_project(
+            str(self.project.id),
+            {"is_single_preview_per_revision": True},
+        )
+
+    def test_extra_preview_rejected_when_single_preview_enabled(self):
+        """
+        With the flag on, adding a second preview to a revision fails (400).
+        """
+        self.enable_single_preview()
+        comment = self.create_comment()
+        preview1 = self.add_preview(comment["id"], revision=1)
+        self.assertEqual(preview1["position"], 1)
+
+        path = (
+            f"/actions/tasks/{self.task_id}/comments/{comment['id']}"
+            f"/preview-files/{preview1['id']}"
+        )
+        response = self.post(path, {}, code=400)
+        self.assertIn("preview", response.get("message", "").lower())
+
+    def test_new_revision_allowed_when_single_preview_enabled(self):
+        """
+        With the flag on, a fresh revision (position 1) is still allowed.
+        """
+        self.enable_single_preview()
+        comment1 = self.create_comment()
+        preview1 = self.add_preview(comment1["id"], revision=1)
+        self.assertEqual(preview1["position"], 1)
+
+        comment2 = self.create_comment()
+        preview2 = self.add_preview(comment2["id"], revision=2)
+        self.assertEqual(preview2["position"], 1)
+        self.assertEqual(preview2["revision"], 2)
+
+    def test_preview_with_revision_zero_is_stored(self):
+        """
+        An explicit revision=0 is a valid value and must be stored as 0,
+        not treated as the auto-increment sentinel.
+        """
+        comment = self.create_comment()
+        path = (
+            f"/actions/tasks/{self.task_id}/comments/{comment['id']}"
+            f"/add-preview"
+        )
+        preview = self.post(path, {"revision": 0})
+        self.assertEqual(preview["revision"], 0)
+
+    def test_preview_without_revision_auto_increments(self):
+        """
+        Omitting revision keeps the auto-increment behaviour: the first
+        preview gets revision 1, the next one 2.
+        """
+        comment1 = self.create_comment()
+        preview1 = self.add_preview(comment1["id"])
+        self.assertEqual(preview1["revision"], 1)
+
+        comment2 = self.create_comment()
+        preview2 = self.add_preview(comment2["id"])
+        self.assertEqual(preview2["revision"], 2)
+
+    def test_extra_preview_allowed_when_flag_off(self):
+        """
+        Regression: with the flag off, extra previews still work.
+        """
+        comment = self.create_comment()
+        preview1 = self.add_preview(comment["id"], revision=1)
+        preview2 = self.add_extra_preview(comment["id"], preview1["id"])
+        self.assertEqual(preview2["position"], 2)

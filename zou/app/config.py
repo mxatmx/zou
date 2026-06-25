@@ -11,7 +11,7 @@ DEBUG_HOST = os.getenv("DEBUG_HOST", "127.0.0.1")
 DEBUG_PORT = int(os.getenv("DEBUG_PORT", 5000))
 
 APP_NAME = "Zou"
-APP_SYSTEM_ERROR_SUBJECT_LINE = "%s system error" % APP_NAME
+APP_SYSTEM_ERROR_SUBJECT_LINE = f"{APP_NAME} system error"
 SECRET_KEY = os.getenv("SECRET_KEY", "mysecretkey")
 
 AUTH_STRATEGY = os.getenv("AUTH_STRATEGY", "auth_local_classic")
@@ -120,6 +120,9 @@ FS_SWIFT_CREATE_CONTAINER = envtobool("FS_SWIFT_CREATE_CONTAINER", False)
 FS_SWIFT_AUTH_VERSION = os.getenv("FS_SWIFT_AUTH_VERSION", "3")
 FS_SWIFT_AES256_ENCRYPTED = envtobool("FS_SWIFT_AES256_ENCRYPTED", False)
 FS_SWIFT_AES256_KEY = os.getenv("FS_SWIFT_AES256_KEY")
+FS_SWIFT_POOL_SIZE = int(os.getenv("FS_SWIFT_POOL_SIZE", 20))
+FS_SWIFT_TIMEOUT = int(os.getenv("FS_SWIFT_TIMEOUT", 60))
+FS_SWIFT_RETRIES = int(os.getenv("FS_SWIFT_RETRIES", 5))
 FS_S3_REGION = os.getenv("FS_S3_REGION")
 FS_S3_ENDPOINT = os.getenv("FS_S3_ENDPOINT")
 FS_S3_ACCESS_KEY = os.getenv("FS_S3_ACCESS_KEY")
@@ -160,6 +163,7 @@ OIDC_SCOPES = os.getenv("OIDC_SCOPES", "openid email profile")
 OIDC_EMAIL_CLAIM = os.getenv("OIDC_EMAIL_CLAIM", "email")
 OIDC_GIVEN_NAME_CLAIM = os.getenv("OIDC_GIVEN_NAME_CLAIM", "given_name")
 OIDC_FAMILY_NAME_CLAIM = os.getenv("OIDC_FAMILY_NAME_CLAIM", "family_name")
+OIDC_REQUIRE_EMAIL_VERIFIED = envtobool("OIDC_REQUIRE_EMAIL_VERIFIED", True)
 OIDC_SKIP_2FA = envtobool("OIDC_SKIP_2FA", False)
 
 LOGS_MODE = os.getenv("LOGS_MODE", "default")

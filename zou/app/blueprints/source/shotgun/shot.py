@@ -144,7 +144,7 @@ class ImportShotgunShotsResource(BaseImportShotgunResource):
         return {x["sg_status"] for x in sg_projects}
 
     def extract_data(self, sg_shot):
-        (frame_in, frame_out) = self.extract_frame_range(sg_shot)
+        frame_in, frame_out = self.extract_frame_range(sg_shot)
         custom_fields = self.extract_custom_data(sg_shot)
         project_id = self.get_project(sg_shot, self.project_map)
         sequence_id = self.get_sequence(sg_shot)
@@ -214,7 +214,7 @@ class ImportShotgunShotsResource(BaseImportShotgunResource):
 
         if shot is None:
             shot = Entity.create(**data, created_by=self.current_user_id)
-            current_app.logger.info("Shot created: %s" % shot)
+            current_app.logger.info(f"Shot created: {shot}")
 
         else:
             if shot.data is None:
@@ -223,7 +223,7 @@ class ImportShotgunShotsResource(BaseImportShotgunResource):
             shot.data.update(data["data"])
             shot.save()
             shots_service.clear_shot_cache(str(shot.id))
-            current_app.logger.info("Shot updated: %s" % shot)
+            current_app.logger.info(f"Shot updated: {shot}")
 
         return shot
 

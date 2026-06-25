@@ -39,13 +39,13 @@ class ThumbnailTestCase(unittest.TestCase):
 
         thumbnail.turn_into_thumbnail(full_path)
         im = Image.open(full_path)
-        (width, height) = im.size
+        width, height = im.size
         self.assertEqual(width, 180)
         self.assertEqual(height, 101)
 
         thumbnail.turn_into_thumbnail(full_path, thumbnail.RECTANGLE_SIZE)
         im = Image.open(full_path)
-        (width, height) = im.size
+        width, height = im.size
         self.assertEqual(width, 150)
         self.assertEqual(height, 100)
 
@@ -71,7 +71,7 @@ class ThumbnailTestCase(unittest.TestCase):
 
         thumbnail.turn_into_thumbnail(full_path, thumbnail.RECTANGLE_SIZE)
         im = Image.open(full_path)
-        (width, height) = im.size
+        width, height = im.size
         self.assertEqual(width, 150)
         self.assertEqual(height, 100)
 
@@ -121,16 +121,16 @@ class ThumbnailTestCase(unittest.TestCase):
         fs.copyfile(file_path_fixture, original_path)
         thumbnail.generate_preview_variants(original_path, preview_id)
 
-        file_path = os.path.join(TEST_FOLDER, "previews-%s.png" % preview_id)
+        file_path = os.path.join(TEST_FOLDER, f"previews-{preview_id}.png")
         self.assertTrue(os.path.exists(file_path))
         self.assertTrue(Image.open(file_path).size, thumbnail.PREVIEW_SIZE)
 
-        file_path = os.path.join(TEST_FOLDER, "thumbnails-%s.png" % preview_id)
+        file_path = os.path.join(TEST_FOLDER, f"thumbnails-{preview_id}.png")
         self.assertTrue(os.path.exists(file_path))
         self.assertTrue(Image.open(file_path).size, thumbnail.RECTANGLE_SIZE)
 
         file_path = os.path.join(
-            TEST_FOLDER, "thumbnails-square-%s.png" % preview_id
+            TEST_FOLDER, f"thumbnails-square-{preview_id}.png"
         )
         self.assertTrue(os.path.exists(file_path))
         self.assertTrue(Image.open(file_path).size, thumbnail.SQUARE_SIZE)
@@ -142,6 +142,6 @@ class ThumbnailTestCase(unittest.TestCase):
 
         thumbnail_path = thumbnail.turn_hdr_into_thumbnail(full_path)
         im = Image.open(thumbnail_path)
-        (width, height) = im.size
+        width, height = im.size
         self.assertEqual(width, 300)
         self.assertEqual(height, 200)

@@ -1,11 +1,32 @@
 # -*- coding: UTF-8 -*-
+import unittest
+
 from tests.base import ApiDBTestCase
 from zou.app.models.department import Department
-from zou.app.models.person import Person
+from zou.app.models.person import Person, normalize_country
 
 from zou.app.utils import fields
 
 from operator import itemgetter
+
+
+class NormalizeCountryTestCase(unittest.TestCase):
+    """
+    Unit coverage for normalize_country, the single source of truth shared
+    by the model validator, the API guard and the CSV import.
+    """
+
+    def test_valid_codes_are_trimmed_and_uppercased(self):
+        for value, expected in [("fr", "FR"), ("FR", "FR"), (" us ", "US")]:
+            self.assertEqual(normalize_country(value), (True, expected))
+
+    def test_empty_values_mean_no_country(self):
+        for value in [None, "", "   "]:
+            self.assertEqual(normalize_country(value), (True, None))
+
+    def test_malformed_values_are_rejected(self):
+        for value in ["France", "FRA", "f", "f1", "éé", 123, ["FR"], 1.5]:
+            self.assertEqual(normalize_country(value), (False, None))
 
 
 class PersonTestCase(ApiDBTestCase):
@@ -45,15 +66,13 @@ class PersonTestCase(ApiDBTestCase):
 
     def test_get_person(self):
         person = self.get_first("data/persons")
-        person_again = self.get(
-            "data/persons/%s?relations=false" % person["id"]
-        )
+        person_again = self.get(f"data/persons/{person['id']}?relations=false")
         self.assertEqual(person, person_again)
         person_with_relations = self.get(
-            "data/persons/%s?relations=true" % person["id"]
+            f"data/persons/{person['id']}?relations=true"
         )
         self.assertTrue("departments" in person_with_relations)
-        self.get_404("data/persons/%s" % fields.gen_uuid())
+        self.get_404(f"data/persons/{fields.gen_uuid()}")
 
     def test_create_person(self):
         data = {
@@ -143,17 +162,104 @@ class PersonTestCase(ApiDBTestCase):
         data = {
             "first_name": "Johnny",
         }
-        self.put("data/persons/%s" % person["id"], data)
-        person_again = self.get("data/persons/%s" % person["id"])
+        self.put(f"data/persons/{person['id']}", data)
+        person_again = self.get(f"data/persons/{person['id']}")
         self.assertEqual(data["first_name"], person_again["first_name"])
-        self.put_404("data/persons/%s" % fields.gen_uuid(), data)
+        self.put_404(f"data/persons/{fields.gen_uuid()}", data)
+
+    def test_person_country_round_trip(self):
+        data = {
+            "first_name": "Country",
+            "last_name": "Tester",
+            "email": "country.tester@gmail.com",
+            "country": "fr",  # lower-case input is normalized to "FR"
+        }
+        person = self.post("data/persons", data)
+        self.assertEqual(person["country"], "FR")
+
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["country"], "FR")
+        person_with_relations = self.get(
+            f"data/persons/{person['id']}?relations=true"
+        )
+        self.assertEqual(person_with_relations["country"], "FR")
+        listed = next(
+            p for p in self.get("data/persons") if p["id"] == person["id"]
+        )
+        self.assertEqual(listed["country"], "FR")
+
+        self.put(f"data/persons/{person['id']}", {"country": "us"})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["country"], "US")
+
+        # Whitespace is trimmed and the value upper-cased on update.
+        self.put(f"data/persons/{person['id']}", {"country": " fr "})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["country"], "FR")
+
+        self.put(f"data/persons/{person['id']}", {"country": None})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertIsNone(person_again["country"])
+
+        self.put(f"data/persons/{person['id']}", {"country": ""})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertIsNone(person_again["country"])
+
+    def test_create_person_without_country(self):
+        data = {
+            "first_name": "NoCountry",
+            "last_name": "Doe",
+            "email": "no.country@gmail.com",
+        }
+        person = self.post("data/persons", data)
+        self.assertIsNone(person["country"])
+
+    def test_create_person_with_invalid_country(self):
+        data = {
+            "first_name": "Bad",
+            "last_name": "Country",
+            "email": "bad.country@gmail.com",
+            "country": "France",
+        }
+        self.post("data/persons", data, 400)
+
+    def test_update_person_with_invalid_country(self):
+        # The PUT guard rejects every malformed category with a clean 400
+        # (never a 500), including non-ASCII and non-string bodies such as an
+        # int or a single-element list from a SAML assertion.
+        person = self.get_first("data/persons")
+        for value in ["France", "f1", "éé", 123, ["FR"]]:
+            self.put(f"data/persons/{person['id']}", {"country": value}, 400)
+
+    def test_country_validator_never_raises_on_direct_write(self):
+        # Direct writes (SSO sign-in, imports, scripts) bypass the API guard,
+        # so the model validator must silently discard bad input instead of
+        # raising.
+        person = Person.get_by(email="ema.doe@gmail.com")
+        person.update({"country": ["FR"]})
+        self.assertIsNone(person.country)
+        person.update({"country": 123})
+        self.assertIsNone(person.country)
+        person.update({"country": "FRA"})
+        self.assertIsNone(person.country)
+        person.update({"country": " us "})
+        self.assertEqual(person.country, "US")
+
+    def test_country_not_exposed_in_present_minimal(self):
+        # The minimal representation is served to non-managers (including
+        # external client/vendor roles), so it must not leak the country.
+        person = Person.get_by(email="ema.doe@gmail.com")
+        person.update({"country": "FR"})
+        self.assertNotIn("country", person.present_minimal())
+        safe = person.serialize_safe()
+        self.assertEqual(safe["country"], "FR")
 
     def test_update_person_with_duplicate_email(self):
         persons = sorted(self.get("data/persons"), key=itemgetter("email"))
         target = persons[0]
         other = next(p for p in persons if p["id"] != target["id"])
         response = self.put(
-            "data/persons/%s" % target["id"],
+            f"data/persons/{target['id']}",
             {"email": other["email"]},
             400,
         )
@@ -162,10 +268,10 @@ class PersonTestCase(ApiDBTestCase):
     def test_update_person_keep_own_email(self):
         person = self.get_first("data/persons")
         self.put(
-            "data/persons/%s" % person["id"],
+            f"data/persons/{person['id']}",
             {"email": person["email"], "first_name": "Johnny"},
         )
-        person_again = self.get("data/persons/%s" % person["id"])
+        person_again = self.get(f"data/persons/{person['id']}")
         self.assertEqual(person_again["first_name"], "Johnny")
         self.assertEqual(person_again["email"], person["email"])
 
@@ -179,7 +285,7 @@ class PersonTestCase(ApiDBTestCase):
             "first_name": "Johnny",
             "departments": departments,
         }
-        self.put("data/persons/%s" % person["id"], data)
+        self.put(f"data/persons/{person['id']}", data)
         person_again = Person.get(person["id"])
         self.assertEqual(
             set(str(department.id) for department in person_again.departments),
@@ -195,23 +301,23 @@ class PersonTestCase(ApiDBTestCase):
             person for person in persons if person["id"] != self.user["id"]
         ][0]
         data = {"active": False}
-        self.put("data/persons/%s" % person["id"], data, 200)
+        self.put(f"data/persons/{person['id']}", data, 200)
         data = {"active": True}
-        self.put("data/persons/%s" % person["id"], data, 400)
+        self.put(f"data/persons/{person['id']}", data, 400)
         config.USER_LIMIT = 100
         data = {"active": True}
-        self.put("data/persons/%s" % person["id"], data)
+        self.put(f"data/persons/{person['id']}", data)
 
     def test_delete_person(self):
         persons = self.get("data/persons")
         self.assertEqual(len(persons), 4)
         persons = sorted(persons, key=itemgetter("email"))
         person = persons[1]
-        self.delete("data/persons/%s" % person["id"])
+        self.delete(f"data/persons/{person['id']}")
         persons = self.get("data/persons")
         self.assertEqual(len(persons), 3)
 
-        self.delete_404("data/persons/%s" % fields.gen_uuid())
+        self.delete_404(f"data/persons/{fields.gen_uuid()}")
         persons = self.get("data/persons")
         self.assertEqual(len(persons), 3)
 
@@ -221,8 +327,8 @@ class PersonTestCase(ApiDBTestCase):
         self.generate_assigned_task()
         self.generate_fixture_comment()
         self.person_id = str(self.person.id)
-        self.get("data/persons/%s" % self.person_id)
-        self.delete("data/persons/%s" % self.person_id, 400)
+        self.get(f"data/persons/{self.person_id}")
+        self.delete(f"data/persons/{self.person_id}", 400)
 
     def test_force_delete(self):
         self.generate_fixture_task_status_todo()
@@ -230,6 +336,6 @@ class PersonTestCase(ApiDBTestCase):
         self.generate_assigned_task()
         self.generate_fixture_comment()
         self.person_id = str(self.person.id)
-        self.get("data/persons/%s" % self.person_id)
-        self.delete("data/persons/%s?force=true" % self.person_id)
-        self.get("data/persons/%s" % self.person_id, 404)
+        self.get(f"data/persons/{self.person_id}")
+        self.delete(f"data/persons/{self.person_id}?force=true")
+        self.get(f"data/persons/{self.person_id}", 404)

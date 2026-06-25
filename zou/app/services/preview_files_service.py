@@ -1,11 +1,14 @@
 import copy
+import math
 import os
-
 import re
+import shutil
+import tempfile
 import time
+import zipfile
 
 import ffmpeg
-import shutil
+from PIL import Image
 
 from sqlalchemy.orm import aliased
 from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
@@ -30,12 +33,15 @@ from zou.app.services import (
 )
 from zou.utils import movie
 from zou.app.utils import (
+    annotations as annotations_renderer,
     events,
     fields,
     remote_job,
     thumbnail as thumbnail_utils,
 )
 from zou.app.services.exception import (
+    AnnotationLockTimeoutException,
+    AnnotationNotFoundException,
     WrongParameterException,
     PreviewFileNotFoundException,
     ProjectNotFoundException,
@@ -100,9 +106,7 @@ def _is_valid_partial_resolution(resolution):
     """
     Return true if the dimension follows the x1080 pattern.
     """
-    return resolution is not None and bool(
-        re.match(r"^x\d{3,4}$", resolution)
-    )
+    return resolution is not None and bool(re.match(r"^x\d{3,4}$", resolution))
 
 
 def validate_resolution(resolution):
@@ -121,8 +125,7 @@ def validate_resolution(resolution):
         or _is_valid_partial_resolution(resolution)
     ):
         raise WrongParameterException(
-            "Invalid resolution %r. Expected format: '1920x1080' or "
-            "'x1080'." % resolution
+            f"Invalid resolution {resolution}. Expected format: '1920x1080' or 'x1080'."
         )
 
 
@@ -140,7 +143,7 @@ def get_preview_file_fps(project, entity=None):
         if entity_data.get("fps", None):
             fps = str(entity_data["fps"]).replace(",", ".")
 
-    return "%.3f" % float(fps)
+    return f"{float(fps):.3f}"
 
 
 def get_project_from_preview_file(preview_file_id):
@@ -208,6 +211,14 @@ def set_preview_file_as_broken(preview_file_id):
     Mark given preview file as broken.
     """
     return update_preview_file(preview_file_id, {"status": "broken"})
+
+
+def set_preview_file_as_missing(preview_file_id):
+    """
+    Mark a preview file as missing: its source binary is gone from
+    storage and renormalization is no longer possible.
+    """
+    return update_preview_file(preview_file_id, {"status": "missing"})
 
 
 def set_preview_file_as_ready(preview_file_id):
@@ -360,12 +371,12 @@ def prepare_and_store_movie(
                     )
                 if err:
                     current_app.logger.error(
-                        "Fail to normalize: %s" % uploaded_movie_path
+                        f"Fail to normalize: {uploaded_movie_path}"
                     )
                     current_app.logger.error(err)
 
                 current_app.logger.info(
-                    "file normalized %s" % normalized_movie_path
+                    f"file normalized {normalized_movie_path}"
                 )
                 current_app.logger.info("file stored")
             except Exception as exc:
@@ -407,7 +418,7 @@ def prepare_and_store_movie(
                     preview_file_id, "thumbnail variants upload", exc
                 )
             current_app.logger.info(
-                "thumbnail created %s" % original_picture_path
+                f"thumbnail created {original_picture_path}"
             )
 
             # Build tiles
@@ -415,7 +426,7 @@ def prepare_and_store_movie(
                 tile_path = movie.generate_tile(normalized_movie_path)
                 file_store.add_picture("tiles", preview_file_id, tile_path)
                 os.remove(tile_path)
-                current_app.logger.info("tile created %s" % tile_path)
+                current_app.logger.info(f"tile created {tile_path}")
             except Exception:
                 current_app.logger.error("Failed to create tile", exc_info=1)
 
@@ -496,7 +507,7 @@ def clear_variant_from_cache(preview_file_id, prefix, extension="png"):
     if config.FS_BACKEND != "local":
         file_path = os.path.join(
             config.TMP_DIR,
-            "cache-%s-%s.%s" % (prefix, preview_file_id, extension),
+            f"cache-{prefix}-{preview_file_id}.{extension}",
         )
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -553,7 +564,13 @@ def update_preview_file_annotations(
         updates = []
     if deletions is None:
         deletions = []
-    with with_preview_file_lock(preview_file_id, timeout=30, wait_timeout=35):
+    with with_preview_file_lock(
+        preview_file_id, timeout=30, wait_timeout=35
+    ) as acquired:
+        if not acquired:
+            raise AnnotationLockTimeoutException(
+                "Could not acquire annotation lock for preview file"
+            )
         preview_file = files_service.get_preview_file_raw(preview_file_id)
         previous_annotations = copy.deepcopy(preview_file.annotations or [])
         annotations = _clean_annotations(previous_annotations)
@@ -708,17 +725,112 @@ def _clear_empty_annotations(annotations):
     ]
 
 
+def _round_time_to_frame(time_value, fps):
+    """
+    Snap a playback time onto the frame grid the Kitsu player uses:
+    the frame duration is 1 / fps rounded to 4 decimals, and rounding is
+    half-up to mirror the JavaScript Math.round used client-side.
+    """
+    precision_factor = 10000
+    frame_duration = (
+        math.floor(1 / fps * precision_factor + 0.5) / precision_factor
+    )
+    frame_number = math.floor(time_value / frame_duration + 0.5)
+    return (
+        math.floor(frame_number * frame_duration * precision_factor + 0.5)
+        / precision_factor
+    )
+
+
+def normalize_annotation_times(annotations, fps):
+    """
+    Collapse annotation entries that land on the same frame into one and
+    snap every entry time onto the frame grid.
+
+    Older Kitsu versions stored unrounded times (sometimes as strings)
+    while current ones snap them to the frame grid, so the same logical
+    frame can exist several times in a preview file's annotation list.
+    The player only displays the first entry matching a frame, which makes
+    the other entries' drawings invisible, and grid-timed deletions or
+    updates never match the legacy entries.
+
+    Objects are deduplicated by id and the input list is not mutated.
+    Returns a (annotations, changed) tuple; entries with unparseable times
+    are kept untouched.
+    """
+    result = []
+    by_frame_time = {}
+    changed = False
+    for annotation in annotations or []:
+        try:
+            time_value = max(float(annotation.get("time") or 0), 0.0)
+        except (TypeError, ValueError):
+            result.append(copy.deepcopy(annotation))
+            continue
+        frame_time = _round_time_to_frame(time_value, fps)
+        existing = by_frame_time.get(frame_time)
+        objects = (annotation.get("drawing") or {}).get("objects", [])
+        if existing is None:
+            entry = copy.deepcopy(annotation)
+            if entry.get("time") != frame_time:
+                changed = True
+            entry["time"] = frame_time
+            entry["drawing"] = {
+                **(entry.get("drawing") or {}),
+                "objects": (entry.get("drawing") or {}).get("objects", []),
+            }
+            by_frame_time[frame_time] = entry
+            result.append(entry)
+        else:
+            changed = True
+            seen_ids = {
+                existing_object.get("id")
+                for existing_object in existing["drawing"]["objects"]
+            }
+            existing["drawing"]["objects"].extend(
+                copy.deepcopy(new_object)
+                for new_object in objects
+                if new_object.get("id") not in seen_ids
+            )
+    return result, changed
+
+
+def normalize_preview_file_annotation_times(preview_file):
+    """
+    Normalize a preview file's annotation times in place (see
+    normalize_annotation_times). Returns True when the stored annotations
+    were modified.
+    """
+    if not preview_file.annotations:
+        return False
+    task = Task.get(preview_file.task_id)
+    project = Project.get(task.project_id).serialize()
+    entity = Entity.get(task.entity_id)
+    fps = float(
+        get_preview_file_fps(
+            project, entity.serialize() if entity is not None else None
+        )
+    )
+    annotations, changed = normalize_annotation_times(
+        preview_file.annotations, fps
+    )
+    if changed:
+        preview_file.update({"annotations": annotations})
+        files_service.clear_preview_file_cache(str(preview_file.id))
+    return changed
+
+
 def get_running_preview_files(cursor_preview_file_id=None, limit=None):
     """
-    Return preview files for all productions with status equals to broken
-    or processing using cursor-based pagination.
+    Return preview files for all productions with status equals to broken,
+    missing or processing using cursor-based pagination.
     """
     query = (
         PreviewFile.query.join(Task)
         .join(Project)
         .join(ProjectStatus, ProjectStatus.id == Project.project_status_id)
         .filter(ProjectStatus.name.in_(("Active", "open", "Open")))
-        .filter(PreviewFile.status.in_(("broken", "processing")))
+        .filter(PreviewFile.status.in_(("broken", "missing", "processing")))
         .add_columns(Task.project_id, Task.task_type_id, Task.entity_id)
         .order_by(PreviewFile.created_at.desc())
     )
@@ -784,6 +896,10 @@ def get_last_preview_file_for_task(task_id):
 
 
 def extract_frame_from_preview_file(preview_file, frame_number):
+    if (preview_file.get("data") or {}).get("imported_only"):
+        # Imported via sync-push: only metadata is here, the binary lives
+        # elsewhere and will arrive via the file sync. Skip silently.
+        return None
     try:
         project = get_project_from_preview_file(preview_file["id"])
     except PreviewFileNotFoundException:
@@ -815,13 +931,311 @@ def replace_extracted_frame_for_preview_file(preview_file, frame_number):
     extracted_frame_path = extract_frame_from_preview_file(
         preview_file, frame_number
     )
+    if extracted_frame_path is None:
+        return
     extracted_frame_path = thumbnail_utils.turn_into_thumbnail(
         extracted_frame_path
     )
     save_variants(preview_file["id"], extracted_frame_path)
 
 
+ANNOTATED_PICTURE_EXTENSIONS = ("jpg", "jpeg", "jpe", "png")
+
+
+def extract_annotation_frame_from_preview_file(
+    preview_file, frame_number=None
+):
+    """
+    Extract the requested frame of a movie preview, or the picture itself
+    for a picture preview, and overlay the matching annotation on it.
+
+    For movies, `frame_number` is required and identifies the frame. For
+    pictures, `frame_number` is ignored and the first annotation entry is
+    used.
+
+    Raises AnnotationNotFoundException when no annotation matches. Returns
+    the path to the composited PNG (caller must delete it), or None when
+    the preview binary is not available.
+    """
+    extension = (preview_file.get("extension") or "").lower()
+    annotations = preview_file.get("annotations") or []
+    if extension == "mp4":
+        if frame_number is None:
+            raise WrongParameterException(
+                "frame_number is required for movie previews"
+            )
+        return _extract_movie_annotation_frame(
+            preview_file, frame_number, annotations
+        )
+    if extension in ANNOTATED_PICTURE_EXTENSIONS:
+        return _extract_picture_annotation_frame(preview_file, annotations)
+    raise WrongParameterException(
+        f"Cannot extract annotated frame from preview with extension "
+        f"{extension!r}"
+    )
+
+
+def _extract_movie_annotation_frame(preview_file, frame_number, annotations):
+    project = get_project_from_preview_file(preview_file["id"])
+    entity = get_entity_from_preview_file(preview_file["id"])
+    fps = float(get_preview_file_fps(project, entity))
+    target_time = (frame_number - 1) / fps
+    tolerance = 1 / (2 * fps)
+    annotation = _find_annotation_at_time(annotations, target_time, tolerance)
+    if annotation is None:
+        raise AnnotationNotFoundException(
+            f"No annotation found for frame {frame_number}"
+        )
+    frame_path = extract_frame_from_preview_file(preview_file, frame_number)
+    if frame_path is None:
+        return None
+    return annotations_renderer.render_annotation_on_image(
+        frame_path, annotation
+    )
+
+
+def _extract_picture_annotation_frame(preview_file, annotations):
+    if not annotations:
+        raise AnnotationNotFoundException(
+            "No annotation found on picture preview"
+        )
+    picture_copy = _copy_picture_preview_to_temp_png(preview_file)
+    if picture_copy is None:
+        return None
+    return annotations_renderer.render_annotation_on_image(
+        picture_copy, annotations[0]
+    )
+
+
+def _copy_picture_preview_to_temp_png(preview_file):
+    if (preview_file.get("data") or {}).get("imported_only"):
+        return None
+    try:
+        picture_path = fs.get_file_path_and_file(
+            config,
+            file_store.get_local_picture_path,
+            file_store.open_picture,
+            "previews",
+            preview_file["id"],
+            preview_file["extension"],
+        )
+    except Exception:
+        return None
+    fd, temp_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    with Image.open(picture_path) as img:
+        img.convert("RGBA").save(temp_path, "PNG")
+    return temp_path
+
+
+def _find_annotation_at_time(annotations, target_time, tolerance):
+    for annotation in annotations:
+        raw_time = annotation.get("time")
+        if raw_time is None:
+            continue
+        try:
+            annotation_time = float(raw_time)
+        except (TypeError, ValueError):
+            continue
+        if abs(annotation_time - target_time) <= tolerance:
+            return annotation
+    return None
+
+
+def extract_all_annotation_frames_from_preview_file(preview_file):
+    """
+    Build a zip archive containing every annotated frame of a movie
+    preview, or every annotated copy of a picture preview.
+
+    Raises AnnotationNotFoundException when the preview has no
+    annotations. Returns the path to a temp zip file (caller must delete
+    it), or None when the preview binary is not available.
+    """
+    entries = _build_annotated_frame_entries(preview_file)
+    if entries is None:
+        return None
+    return _bundle_annotated_frames_into_zip(entries)
+
+
+def extract_all_annotation_frames_pdf_from_preview_file(preview_file):
+    """
+    Build a multi-page PDF with one page per annotated frame (movie) or
+    per annotated copy of the picture (picture preview).
+
+    Raises AnnotationNotFoundException when the preview has no
+    annotations. Returns the path to a temp pdf file (caller must delete
+    it), or None when the preview binary is not available.
+    """
+    entries = _build_annotated_frame_entries(preview_file)
+    if entries is None:
+        return None
+    return _bundle_annotated_frames_into_pdf(entries)
+
+
+def _build_annotated_frame_entries(preview_file):
+    """
+    Common entry-point for the zip and pdf bundlers: render every
+    annotated frame of the preview to a temp PNG and return the list of
+    (arcname, path) tuples. Returns None when the binary is unavailable;
+    raises AnnotationNotFoundException when there is nothing to render
+    and WrongParameterException for unsupported extensions.
+    """
+    annotations = preview_file.get("annotations") or []
+    if not annotations:
+        raise AnnotationNotFoundException("Preview file has no annotations")
+    extension = (preview_file.get("extension") or "").lower()
+    base_name = _annotated_frame_base_name(preview_file)
+    if extension == "mp4":
+        return _build_movie_annotation_entries(
+            preview_file, annotations, base_name
+        )
+    if extension in ANNOTATED_PICTURE_EXTENSIONS:
+        return _build_picture_annotation_entries(
+            preview_file, annotations, base_name
+        )
+    raise WrongParameterException(
+        f"Cannot extract annotated frames from preview with extension "
+        f"{extension!r}"
+    )
+
+
+def _annotated_frame_base_name(preview_file):
+    full_name = names_service.get_preview_file_name(preview_file["id"])
+    return os.path.splitext(full_name)[0]
+
+
+_NO_FRAME_EXTRACTED_MSG = (
+    "No annotated frame could be extracted from this preview"
+)
+
+
+def _build_movie_annotation_entries(preview_file, annotations, base_name):
+    """
+    Returns a list of (arcname, temp_png_path) tuples ready to be zipped,
+    or None if the movie binary is unavailable. Cleans up partial work on
+    failure.
+
+    Individual annotations whose frame ffmpeg fails to extract (returns
+    a path to a non-existent file, e.g. when the annotation's time falls
+    past the movie's EOF) are skipped rather than aborting the whole
+    bundle.
+    """
+    project = get_project_from_preview_file(preview_file["id"])
+    entity = get_entity_from_preview_file(preview_file["id"])
+    fps = float(get_preview_file_fps(project, entity))
+    entries = []
+    try:
+        for annotation in annotations:
+            raw_time = annotation.get("time")
+            try:
+                annotation_time = float(raw_time)
+            except (TypeError, ValueError):
+                continue
+            frame_number = max(1, round(annotation_time * fps) + 1)
+            frame_path = extract_frame_from_preview_file(
+                preview_file, frame_number
+            )
+            if frame_path is None:
+                _cleanup_entries(entries)
+                return None
+            if not os.path.exists(frame_path):
+                continue
+            owned_path = _claim_extracted_frame(frame_path)
+            rendered = annotations_renderer.render_annotation_on_image(
+                owned_path, annotation
+            )
+            entries.append((f"{base_name}_frame_{frame_number}.png", rendered))
+    except Exception:
+        _cleanup_entries(entries)
+        raise
+    return entries
+
+
+def _build_picture_annotation_entries(preview_file, annotations, base_name):
+    entries = []
+    try:
+        for index, annotation in enumerate(annotations, start=1):
+            picture_copy = _copy_picture_preview_to_temp_png(preview_file)
+            if picture_copy is None:
+                _cleanup_entries(entries)
+                return None
+            rendered = annotations_renderer.render_annotation_on_image(
+                picture_copy, annotation
+            )
+            entries.append((f"{base_name}_frame_{index}.png", rendered))
+    except Exception:
+        _cleanup_entries(entries)
+        raise
+    return entries
+
+
+def _claim_extracted_frame(extracted_path):
+    """
+    Move the frame ffmpeg wrote at a deterministic
+    `tmp/<movie>_<frame>.png` slot to a fresh mkstemp path. Required
+    because that deterministic slot is shared with other callers (e.g.
+    the single-frame extract route which `os.remove`s it in a finally),
+    and concurrent calls could yank the file from under the bundler.
+    """
+    fd, owned_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    shutil.move(extracted_path, owned_path)
+    return owned_path
+
+
+def _cleanup_entries(entries):
+    for _, path in entries:
+        if path and os.path.exists(path):
+            os.remove(path)
+
+
+def _bundle_annotated_frames_into_zip(entries):
+    if not entries:
+        raise AnnotationNotFoundException(_NO_FRAME_EXTRACTED_MSG)
+    fd, zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, src_path in entries:
+                zf.write(src_path, arcname=arcname)
+    finally:
+        _cleanup_entries(entries)
+    return zip_path
+
+
+def _bundle_annotated_frames_into_pdf(entries):
+    """
+    Stitch every PNG into a multi-page PDF via Pillow. PDF doesn't
+    support alpha, so each frame is flattened to RGB. 150 DPI keeps page
+    sizes reasonable for HD frames without blowing up the file.
+    """
+    if not entries:
+        raise AnnotationNotFoundException(_NO_FRAME_EXTRACTED_MSG)
+    fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    images = []
+    try:
+        for _, src_path in entries:
+            images.append(Image.open(src_path).convert("RGB"))
+        head, tail = images[0], images[1:]
+        head.save(
+            pdf_path,
+            "PDF",
+            save_all=True,
+            append_images=tail,
+            resolution=150.0,
+        )
+    finally:
+        for img in images:
+            img.close()
+        _cleanup_entries(entries)
+    return pdf_path
+
+
 def extract_tile_from_preview_file(preview_file):
+    if (preview_file.get("data") or {}).get("imported_only"):
+        # Imported via sync-push: metadata only. Skip silently.
+        return None
     if preview_file["extension"] == "mp4":
         preview_file_path = fs.get_file_path_and_file(
             config,
@@ -846,7 +1260,7 @@ def reset_movie_files_metadata():
         .join(Project)
         .join(ProjectStatus, Project.project_status_id == ProjectStatus.id)
         .filter(ProjectStatus.name.in_(("Active", "open", "Open")))
-        .filter(PreviewFile.status.not_in(("broken", "processing")))
+        .filter(PreviewFile.status.not_in(("broken", "missing", "processing")))
         .filter(PreviewFile.extension == "mp4")
     )
     for preview_file in preview_files:
@@ -889,7 +1303,7 @@ def reset_picture_files_metadata():
         .join(Project)
         .join(ProjectStatus, Project.project_status_id == ProjectStatus.id)
         .filter(ProjectStatus.name.in_(("Active", "open", "Open")))
-        .filter(PreviewFile.status.not_in(("broken", "processing")))
+        .filter(PreviewFile.status.not_in(("broken", "missing", "processing")))
         .filter(PreviewFile.extension == "png")
     )
     for preview_file in preview_files:
@@ -943,7 +1357,7 @@ def generate_preview_extra(
         .join(Project)
         .join(ProjectStatus, Project.project_status_id == ProjectStatus.id)
         .filter(ProjectStatus.name.in_(("Active", "open", "Open")))
-        .filter(PreviewFile.status.not_in(("broken", "processing")))
+        .filter(PreviewFile.status.not_in(("broken", "missing", "processing")))
         .filter(PreviewFile.extension.in_(("mp4", "png")))
     )
     if project is not None:
@@ -1000,8 +1414,7 @@ def generate_preview_extra(
             preview_file_already_in_cache = os.path.isfile(
                 os.path.join(
                     config.TMP_DIR,
-                    "cache-%s-%s.%s"
-                    % (prefix, preview_file_id, preview_file.extension),
+                    f"cache-{prefix}-{preview_file_id}.{preview_file.extension}",
                 )
             )
         try:

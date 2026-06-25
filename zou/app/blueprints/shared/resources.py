@@ -3,6 +3,8 @@ from flask_fs.errors import FileNotFound
 from flask_restful import Resource
 
 from zou.app.blueprints.previews.resources import (
+    ALLOWED_FILE_EXTENSION,
+    ALLOWED_PICTURE_EXTENSION,
     send_movie_file,
     send_picture_file,
     send_standard_file,
@@ -25,7 +27,10 @@ from zou.app.services import (
     preview_files_service,
     tasks_service,
 )
-from zou.app.services.exception import PreviewFileNotFoundException
+from zou.app.services.exception import (
+    PreviewFileNotFoundException,
+    WrongParameterException,
+)
 from zou.app.utils import permissions, validation
 
 
@@ -303,7 +308,9 @@ class SharedPlaylistCommentsResource(Resource):
 
 
 class SharedPlaylistCommentResource(Resource):
-    """Edit or delete a single comment authored by a guest."""
+    """
+    Edit or delete a single comment authored by a guest.
+    """
 
     @require_valid_playlist_share_link()
     def put(self, token, comment_id):
@@ -365,7 +372,9 @@ class SharedPlaylistCommentResource(Resource):
 
 
 class SharedPlaylistCommentAttachmentsResource(Resource):
-    """Add an attachment file to a guest-owned comment."""
+    """
+    Add an attachment file to a guest-owned comment.
+    """
 
     @require_valid_playlist_share_link()
     def post(self, token, comment_id):
@@ -396,7 +405,9 @@ class SharedPlaylistCommentAttachmentsResource(Resource):
 
 
 class SharedPlaylistCommentAttachmentResource(Resource):
-    """Delete one attachment from a guest-owned comment."""
+    """
+    Delete one attachment from a guest-owned comment.
+    """
 
     @require_valid_playlist_share_link()
     def delete(self, token, comment_id, attachment_id):
@@ -423,7 +434,9 @@ class SharedPlaylistCommentAttachmentResource(Resource):
 
 
 class SharedPlaylistAttachmentFileResource(Resource):
-    """Download an attachment that belongs to a visible shared comment."""
+    """
+    Download an attachment that belongs to a visible shared comment.
+    """
 
     @require_valid_playlist_share_link()
     def get(self, token, attachment_id, file_name):
@@ -523,10 +536,10 @@ class SharedPlaylistAnnotationsResource(Resource):
         except Exception:
             return {"error": "Guest not part of this shared playlist"}, 403
 
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
 
         preview_file = files_service.get_preview_file(preview_file_id)
         task = tasks_service.get_task(preview_file["task_id"])
@@ -538,22 +551,6 @@ class SharedPlaylistAnnotationsResource(Resource):
             updates=updates,
             deletions=deletions,
         )
-
-
-def _is_preview_file_in_shared_playlist(token, preview_file_id):
-    """
-    Ensure the given preview file id belongs to a shot (or one of its
-    revisions) of the playlist exposed by the share token.
-    """
-    playlist = playlist_sharing_service.get_shared_playlist(token)
-    pid = str(preview_file_id)
-    for shot in playlist.get("shots", []) or []:
-        if str(shot.get("preview_file_id") or "") == pid:
-            return True
-        for sub in shot.get("preview_file_previews", []) or []:
-            if str(sub.get("id") or "") == pid:
-                return True
-    return False
 
 
 def _is_task_in_shared_playlist(token, task_id):
@@ -604,10 +601,10 @@ class SharedPlaylistPreviewFileResource(Resource):
           403:
             description: Preview file is not part of this shared playlist
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
         return files_service.get_preview_file(preview_file_id)
 
 
@@ -656,14 +653,14 @@ class SharedPlaylistPreviewFileMovieResource(Resource):
                     error:
                       type: string
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
         try:
             return send_movie_file(preview_file_id)
         except FileNotFound:
-            return {"error": "Preview file not found"}, 404
+            raise PreviewFileNotFoundException
 
 
 class SharedPlaylistPreviewFileThumbnailResource(Resource):
@@ -710,14 +707,14 @@ class SharedPlaylistPreviewFileThumbnailResource(Resource):
                     error:
                       type: string
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
         try:
             return send_picture_file("thumbnails", preview_file_id)
         except FileNotFound:
-            return {"error": "Thumbnail not found"}, 404
+            raise PreviewFileNotFoundException
 
 
 class SharedPlaylistPreviewFileOriginalResource(Resource):
@@ -764,14 +761,92 @@ class SharedPlaylistPreviewFileOriginalResource(Resource):
                     error:
                       type: string
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
         try:
             return send_picture_file("original", preview_file_id)
         except FileNotFound:
-            return {"error": "Original not found"}, 404
+            raise PreviewFileNotFoundException
+
+
+class SharedPlaylistPreviewFileExtensionResource(Resource):
+    @require_valid_playlist_share_link()
+    def get(self, token, preview_file_id, extension):
+        """
+        Get shared original picture preview for any extension
+        ---
+        description: Serve the original still preview for an arbitrary
+          extension (gif, svg, jpg, pdf, ...), authorized by the share token.
+          Mirrors the authenticated
+          ``/pictures/originals/preview-files/<id>.<extension>`` route, which
+          the ``.png``-only shared route did not cover, so animated GIFs and
+          other non-PNG originals 404'd through a share link.
+        tags:
+          - Playlists
+        parameters:
+          - in: path
+            name: token
+            required: true
+            schema:
+              type: string
+            description: Share link token
+          - in: path
+            name: preview_file_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Preview file unique identifier
+          - in: path
+            name: extension
+            required: true
+            schema:
+              type: string
+            description: File extension
+        responses:
+          200:
+            description: Original picture file
+            content:
+              application/octet-stream:
+                schema:
+                  type: string
+                  format: binary
+          400:
+            description: Extension not allowed
+          403:
+            description: Preview file is not part of this shared playlist
+          404:
+            description: Original file missing
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    error:
+                      type: string
+        """
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
+        extension = extension.lower()
+        if extension not in ALLOWED_PICTURE_EXTENSION | ALLOWED_FILE_EXTENSION:
+            raise WrongParameterException(
+                f"Extension not allowed: {extension}"
+            )
+        try:
+            if extension == "png":
+                return send_picture_file("original", preview_file_id)
+            elif extension == "pdf":
+                return send_standard_file(
+                    preview_file_id, extension, "application/pdf"
+                )
+            else:
+                return send_standard_file(preview_file_id, extension)
+        except FileNotFound:
+            raise PreviewFileNotFoundException
 
 
 class SharedPlaylistPreviewFileTileResource(Resource):
@@ -818,14 +893,14 @@ class SharedPlaylistPreviewFileTileResource(Resource):
                     error:
                       type: string
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
-            return {
-                "error": "Preview file not part of this shared playlist"
-            }, 403
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
+            raise permissions.PermissionDenied
         try:
             return send_picture_file("tiles", preview_file_id)
         except FileNotFound:
-            return {"error": "Tile not found"}, 404
+            raise PreviewFileNotFoundException
 
 
 class SharedPlaylistPreviewFileDownloadResource(Resource):
@@ -867,7 +942,9 @@ class SharedPlaylistPreviewFileDownloadResource(Resource):
           404:
             description: Preview file not on disk
         """
-        if not _is_preview_file_in_shared_playlist(token, preview_file_id):
+        if not playlist_sharing_service.is_preview_file_in_shared_playlist(
+            token, preview_file_id
+        ):
             raise permissions.PermissionDenied
         preview_file = files_service.get_preview_file(preview_file_id)
         extension = preview_file["extension"]

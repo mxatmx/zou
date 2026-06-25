@@ -12,6 +12,7 @@ STATUSES = [
     ("processing", "Processing"),
     ("ready", "Ready"),
     ("broken", "Broken"),
+    ("missing", "Missing"),
 ]
 
 VALIDATION_STATUSES = [
@@ -48,6 +49,11 @@ class PreviewFile(db.Model, BaseMixin, SerializerMixin):
     duration = db.Column(db.Float, default=0)
     data = db.Column(JSONB)
 
+    # Token cost of generating this preview file (when produced by an AI
+    # pipeline). Nullable: only set when relevant.
+    token_in = db.Column(db.Integer(), nullable=True)
+    token_out = db.Column(db.Integer(), nullable=True)
+
     task_id = db.Column(
         UUIDType(binary=False), db.ForeignKey("task.id"), index=True
     )
@@ -68,13 +74,12 @@ class PreviewFile(db.Model, BaseMixin, SerializerMixin):
     uploaded_movie_name = db.Column(db.String(150))  # deprecated
 
     def __repr__(self):
-        return "<PreviewFile %s>" % self.id
+        return f"<PreviewFile {self.id}>"
 
     @classmethod
     def create_from_import(cls, data):
-        del data["type"]
-        if "comments" in data:
-            del data["comments"]
+        data.pop("type", None)
+        data.pop("comments", None)
         previous_data = cls.get(data["id"])
         if "status" not in data or data["status"] is None:
             data["status"] = "ready"
@@ -99,6 +104,8 @@ class PreviewFile(db.Model, BaseMixin, SerializerMixin):
                 "task_id": self.task_id,
                 "person_id": self.person_id,
                 "created_at": self.created_at,
+                "token_in": self.token_in,
+                "token_out": self.token_out,
             }
         )
 

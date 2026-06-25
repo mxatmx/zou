@@ -10,7 +10,6 @@ import tempfile
 import ffmpeg
 import opentimelineio as otio
 
-
 logger = logging.getLogger(__name__)
 loghandler = logging.StreamHandler()
 loghandler.setLevel(logging.INFO)
@@ -52,12 +51,15 @@ def generate_thumbnail(movie_path):
     takes a picture at the first frame of the movie.
     """
     file_source_name = os.path.basename(movie_path)
-    file_target_name = "%s.png" % file_source_name[:-4]
+    file_target_name = f"{file_source_name[:-4]}.png"
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
 
     try:
+        # `update=1` lets the image2 muxer write a single PNG to a
+        # plain (non-pattern) filename on ffmpeg ≥ 6, which otherwise
+        # refuses the path and skips the write.
         ffmpeg.input(movie_path, ss="00:00:00").output(
-            file_target_path, vframes=1
+            file_target_path, vframes=1, update=1
         ).overwrite_output().run(quiet=True)
     except ffmpeg._run.Error as e:
         log_ffmpeg_error(e, "an error occured during generate_thumbnail")
@@ -82,8 +84,13 @@ def extract_frame_from_movie(movie_path, frame_number, movie_fps):
     ).to_time_string()
 
     try:
+        # ffmpeg ≥ 6 rejects non-pattern filenames in the image2 muxer
+        # unless `-update 1` is set. Without it the muxer logs "filename
+        # does not contain an image sequence pattern" and the frame is
+        # not always written. `update=1` keeps the single-PNG path
+        # explicit and works on older ffmpeg too.
         ffmpeg.input(movie_path, ss=frame_time).output(
-            file_target_path, vframes=1
+            file_target_path, vframes=1, update=1
         ).overwrite_output().run(quiet=False)
     except ffmpeg._run.Error as e:
         log_ffmpeg_error(e, "extracting_frame")
@@ -221,7 +228,18 @@ def normalize_encoding(
         vcodec="libx264",
         movflags="+faststart",
         x264opts=f"keyint={keyframes}:scenecut=0",
-        s="%sx%s" % (width, height),
+        vf=(
+            # De-anamorph first so anamorphic sources (non-square pixels)
+            # are fit by their *display* size, not their raster size; a
+            # no-op for the common square-pixel case (sar == 1). Then fit
+            # inside the target canvas preserving the ratio and pad with
+            # black bars instead of stretching.
+            "scale=trunc(iw*sar/2)*2:ih,"
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+            "setsar=1"
+        ),
     )
     try:
         logger.info(f"ffmpeg {' '.join(stream.get_args())}")
@@ -237,14 +255,14 @@ def normalize_movie(movie_path, fps, width, height):
     Generates a high def movie and a low def movie.
     """
     file_source_name = os.path.basename(movie_path)
-    file_target_name = "%s.mp4" % file_source_name[:-8]
+    file_target_name = f"{file_source_name[:-8]}.mp4"
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
-    low_file_target_name = "%s_low.mp4" % file_source_name[:-8]
+    low_file_target_name = f"{file_source_name[:-8]}_low.mp4"
     low_file_target_path = os.path.join(
         tempfile.gettempdir(), low_file_target_name
     )
 
-    (w, h) = get_movie_size(movie_path)
+    w, h = get_movie_size(movie_path)
     resize_factor = w / h
 
     if width is None:
@@ -370,7 +388,7 @@ def add_empty_soundtrack(file_path, try_count=1):
         logger.error(f"Err in soundtrack: {err}")
         logger.error(f"Err code: {sp.returncode}")
         if try_count <= 1:
-            (width, height) = get_movie_size(file_path)
+            width, height = get_movie_size(file_path)
             if height % 2 == 1:
                 height = height + 1
             stream = ffmpeg.input(file_path)
@@ -382,7 +400,7 @@ def add_empty_soundtrack(file_path, try_count=1):
                 preset="slow",
                 vcodec="libx264",
                 movflags="+faststart",
-                s="%sx%s" % (width, height),
+                s=f"{width}x{height}",
             )
             try:
                 logger.info(f"ffmpeg {' '.join(stream.get_args())}")
@@ -420,16 +438,16 @@ def build_playlist_movie(
     result = {"message": "", "success": False}
     if len(tmp_file_paths) > 0:
         # Get movie dimensions
-        (first_movie_file_path, _) = tmp_file_paths[0]
+        first_movie_file_path, _ = tmp_file_paths[0]
         if width is None:
-            (width, height) = get_movie_size(first_movie_file_path)
+            width, height = get_movie_size(first_movie_file_path)
 
         # Clean empty audio tracks
         for tmp_file_path, file_name in tmp_file_paths:
             if not has_soundtrack(tmp_file_path):
                 ret, _, err = add_empty_soundtrack(tmp_file_path)
                 if err:
-                    result["message"] += "%s\n" % err
+                    result["message"] += f"{err}\n"
                 if ret != 0:
                     return result
             in_files.append(tmp_file_path)
@@ -460,18 +478,18 @@ def concat_demuxer(in_files, output_path, *args):
         if len(streams) != 2:
             return {
                 "success": False,
-                "message": "%s has an unexpected stream number (%s)"
-                % (input_path, len(streams)),
+                "message": (
+                    f"{input_path} has an unexpected stream number "
+                    f"({len(streams)})"
+                ),
             }
 
         stream_infos = {streams[0]["codec_type"], streams[1]["codec_type"]}
         if stream_infos != {"video", "audio"}:
             return {
                 "success": False,
-                "message": "%s has unexpected stream type (%s)"
-                % (
-                    input_path,
-                    {streams[0]["codec_type"], streams[1]["codec_type"]},
+                "message": (
+                    f"{input_path} has unexpected stream type ({stream_infos})"
                 ),
             }
 
@@ -481,12 +499,12 @@ def concat_demuxer(in_files, output_path, *args):
         if video_index != 0:
             return {
                 "success": False,
-                "message": "%s has an unexpected stream order" % input_path,
+                "message": f"{input_path} has an unexpected stream order",
             }
 
     with tempfile.NamedTemporaryFile(mode="w") as temp:
         for input_path in in_files:
-            temp.write("file '%s'\n" % input_path)
+            temp.write(f"file '{input_path}'\n")
         temp.flush()
 
         stream = ffmpeg.input(temp.name, format="concat", safe=0)

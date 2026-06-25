@@ -536,6 +536,10 @@ def check_task_action_access(task_id):
                     ]
                     in user["departments"]
                 )
+            if not is_allowed:
+                # The entity creator keeps task action access (e.g. an artist's concept).
+                entity = entities_service.get_entity(task["entity_id"])
+                is_allowed = entity["created_by"] == user["id"]
 
     if not is_allowed:
         raise permissions.PermissionDenied
@@ -593,15 +597,13 @@ def check_comment_access(comment_id):
             current_user = persons_service.get_current_user()
             project = projects_service.get_project(task["project_id"])
             if project.get("is_clients_isolated", False):
-                if (
-                    comment["person_id"] != current_user["id"]
-                    and not comment.get("for_client", False)
-                ):
+                if comment["person_id"] != current_user[
+                    "id"
+                ] and not comment.get("for_client", False):
                     raise permissions.PermissionDenied
-            if (
-                persons_service.get_person(person_id)["role"] == "client"
-                or comment.get("for_client", False)
-            ):
+            if persons_service.get_person(person_id)[
+                "role"
+            ] == "client" or comment.get("for_client", False):
                 return True
             else:
                 raise permissions.PermissionDenied
@@ -828,11 +830,18 @@ def check_task_department_access(task_id, person_id):
     return is_allowed
 
 
-def check_person_is_not_bot(person_id):
+def check_person_is_not_bot(person_id, project_id=None):
     """
-    Return true if person is not a bot else raise PermissionDenied
+    Return true if person is not a bot else raise PermissionDenied.
+
+    Bots are allowed when project_id is given and that project has bot
+    collaboration enabled (used for AI-agent task assignment and time logs).
     """
     if persons_service.get_person(person_id)["is_bot"]:
+        if project_id is not None:
+            project = Project.get(project_id)
+            if project is not None and project.is_bot_collaboration_enabled:
+                return True
         raise permissions.PermissionDenied
     else:
         return True

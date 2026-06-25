@@ -33,7 +33,7 @@ class PlaylistTestCase(ApiDBTestCase):
 
     def test_get_playlists(self):
         self.generate_fixture_playlist("Playlist 1")
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
         self.assertEqual(len(playlists), 1)
 
     def test_get_playlists_by_task_type(self):
@@ -49,8 +49,7 @@ class PlaylistTestCase(ApiDBTestCase):
             "Playlist 3", task_type_id=self.task_type_animation.id
         )
         playlists = self.get(
-            "data/projects/%s/playlists?task_type_id=%s"
-            % (self.project_id, self.task_type_animation.id)
+            f"data/projects/{self.project_id}/playlists?task_type_id={self.task_type_animation.id}"
         )
         self.assertEqual(len(playlists), 2)
         self.assertEqual(playlists[0]["name"], "Playlist 3")
@@ -58,9 +57,9 @@ class PlaylistTestCase(ApiDBTestCase):
 
     def test_delete_playlist(self):
         self.generate_fixture_playlist("Playlist 1")
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
-        self.delete("data/playlists/%s" % playlists[0]["id"])
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
+        self.delete(f"data/playlists/{playlists[0]['id']}")
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
         self.assertEqual(len(playlists), 0)
 
     def test_delete_playlist_with_notifications(self):
@@ -71,9 +70,9 @@ class PlaylistTestCase(ApiDBTestCase):
             author_id=self.user["id"],
             playlist_id=self.playlist.id,
         )
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
-        self.delete("data/playlists/%s" % playlists[0]["id"])
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
+        self.delete(f"data/playlists/{playlists[0]['id']}")
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
         self.assertEqual(len(playlists), 0)
         notifications = Notification.query.filter_by(
             playlist_id=self.playlist.id
@@ -89,12 +88,26 @@ class PlaylistTestCase(ApiDBTestCase):
             playlist_id=self.playlist.id,
         )
         playlists_service.remove_playlist(str(self.playlist.id))
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
         self.assertEqual(len(playlists), 0)
         notifications = Notification.query.filter_by(
             playlist_id=self.playlist.id
         ).all()
         self.assertEqual(len(notifications), 0)
+
+    def test_delete_playlist_with_share_links(self):
+        self.generate_fixture_playlist("Playlist 1")
+        playlist_sharing_service.create_share_link(
+            str(self.playlist.id), self.user["id"]
+        )
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
+        self.delete(f"data/playlists/{playlists[0]['id']}")
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
+        self.assertEqual(len(playlists), 0)
+        share_links = PlaylistShareLink.query.filter_by(
+            playlist_id=self.playlist.id
+        ).all()
+        self.assertEqual(len(share_links), 0)
 
     def test_remove_playlist_with_share_links(self):
         self.generate_fixture_playlist("Playlist 1")
@@ -102,17 +115,59 @@ class PlaylistTestCase(ApiDBTestCase):
             str(self.playlist.id), self.user["id"]
         )
         playlists_service.remove_playlist(str(self.playlist.id))
-        playlists = self.get("data/projects/%s/playlists" % self.project_id)
+        playlists = self.get(f"data/projects/{self.project_id}/playlists")
         self.assertEqual(len(playlists), 0)
         share_links = PlaylistShareLink.query.filter_by(
             playlist_id=self.playlist.id
         ).all()
         self.assertEqual(len(share_links), 0)
 
+    def test_create_playlist_for_each_entity_type(self):
+        """
+        `for_entity` round-trips for every supported entity type.
+
+        The column is permissive `String(10)` but the CRUD whitelists the
+        set so a stray value cannot land in storage; this test pins the
+        contract for each accepted value.
+
+        """
+        for for_entity in ("shot", "asset", "sequence", "edit", "episode"):
+            created = self.post(
+                "data/playlists/",
+                {
+                    "name": f"Playlist {for_entity}",
+                    "project_id": self.project_id,
+                    "for_entity": for_entity,
+                },
+                201,
+            )
+            self.assertEqual(created["for_entity"], for_entity)
+            fetched = self.get(f"data/playlists/{created['id']}")
+            self.assertEqual(fetched["for_entity"], for_entity)
+
+    def test_create_playlist_rejects_unknown_for_entity(self):
+        self.post(
+            "data/playlists/",
+            {
+                "name": "Bad playlist",
+                "project_id": self.project_id,
+                "for_entity": "banana",
+            },
+            400,
+        )
+
+    def test_update_playlist_rejects_unknown_for_entity(self):
+        self.generate_fixture_playlist("Playlist 1")
+        self.put(
+            f"data/playlists/{self.playlist.id}",
+            {"for_entity": "banana"},
+            400,
+        )
+
     def test_download_playlist(self):
         self.generate_fixture_playlist("Playlist 1", for_client=False)
         result_file_path = self.get_file_path("playlist.zip")
-        url_path = "/data/playlists/%s/download/zip" % self.playlist.id
+        url_path = f"/data/playlists/{self.playlist.id}/download/zip"
         self.create_test_folder()
         self.download_file(url_path, result_file_path)
 
@@ -123,5 +178,5 @@ class PlaylistTestCase(ApiDBTestCase):
         self.log_in_client()
         self.download_file(url_path, result_file_path, 403)
         self.generate_fixture_playlist("Playlist 2", for_client=True)
-        url_path = "/data/playlists/%s/download/zip" % self.playlist.id
+        url_path = f"/data/playlists/{self.playlist.id}/download/zip"
         self.download_file(url_path, result_file_path)

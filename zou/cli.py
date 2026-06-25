@@ -28,11 +28,13 @@ def _get_db_uri():
 
 
 def _get_alembic_config():
-    """Build an Alembic config that talks directly to the DB.
+    """
+    Build an Alembic config that talks directly to the DB.
 
     Bypasses Flask/Flask-SQLAlchemy/Flask-Migrate entirely — only needs
     Alembic + the DB driver.  env.py detects the absence of a Flask app
     context and reads the URL from the Alembic config instead.
+
     """
     from alembic.config import Config
 
@@ -46,9 +48,11 @@ def _get_alembic_config():
 
 
 def _get_alembic_config_legacy():
-    """Alembic config that includes both current and legacy migrations.
+    """
+    Alembic config that includes both current and legacy migrations.
 
     Used as fallback when an instance is on a pre-squash revision.
+
     """
     from alembic.config import Config
 
@@ -416,7 +420,7 @@ def change_password(email, password):
             auth.validate_password(password)
             password = auth.encrypt_password(password)
             persons_service.update_password(email, password)
-            print("Password changed for %s" % email)
+            print(f"Password changed for {email}")
         except auth.PasswordTooShortException:
             print("The password is too short.")
             sys.exit(1)
@@ -621,6 +625,84 @@ def sync_full(
 
 @cli.command()
 @click.option("--source", default="http://localhost:5000", show_default=True)
+@click.option("--project", required=True)
+def sync_verify(source, project):
+    """
+    Compare project-scoped row counts between source and current instance.
+    Useful after `sync-full --only-projects --project ...` to spot silently
+    dropped batches and tables missing from the sync. Reads SYNC_LOGIN and
+    SYNC_PASSWORD from the environment.
+    """
+    from zou.app.utils import commands
+
+    login = os.getenv("SYNC_LOGIN")
+    password = os.getenv("SYNC_PASSWORD")
+    commands.verify_project_against_source(source, login, password, project)
+
+
+@cli.command()
+@click.option("--target", required=True)
+@click.option("--project", required=True)
+@click.option("--batch-size", default=200, show_default=True, type=int)
+@click.option(
+    "--throttle",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Seconds to sleep between batch POSTs (e.g. 0.5).",
+)
+@click.option(
+    "--broadcast",
+    is_flag=True,
+    default=False,
+    help=(
+        "Let the target emit events for every imported row "
+        "(api_event + Redis publish). Off by default — bulk imports "
+        "don't need a live event storm on the target."
+    ),
+)
+def sync_push(target, project, batch_size, throttle, broadcast):
+    """
+    Push a project from the current instance to a target zou instance via
+    /import/kitsu/* routes. Reference data (persons, departments, task
+    types/statuses, asset types, studios) must already exist on the target
+    with matching UUIDs. Reads SYNC_LOGIN and SYNC_PASSWORD from the
+    environment.
+    """
+    from zou.app.utils import commands
+
+    login = os.getenv("SYNC_LOGIN")
+    password = os.getenv("SYNC_PASSWORD")
+    commands.push_project_to_target(
+        target,
+        login,
+        password,
+        project,
+        batch_size=batch_size,
+        throttle=throttle,
+        silent=not broadcast,
+    )
+
+
+@cli.command()
+@click.option("--target", required=True)
+@click.option("--project", required=True)
+def sync_push_verify(target, project):
+    """
+    Compare project-scoped row counts between the current instance and a
+    target instance. Run after ``sync-push --target ... --project ...`` to
+    spot rows that did not reach the target. Reads SYNC_LOGIN and
+    SYNC_PASSWORD from the environment.
+    """
+    from zou.app.utils import commands
+
+    login = os.getenv("SYNC_LOGIN")
+    password = os.getenv("SYNC_PASSWORD")
+    commands.verify_project_against_target(target, login, password, project)
+
+
+@cli.command()
+@click.option("--source", default="http://localhost:5000", show_default=True)
 @click.option("--project", default=None, show_default=True)
 @click.option(
     "--multithreaded", is_flag=True, show_default=True, default=False
@@ -628,6 +710,20 @@ def sync_full(
 @click.option("--number-workers", default=30, show_default=True, type=int)
 @click.option("--number-attemps", default=3, show_default=True, type=int)
 @click.option("--force-resync", is_flag=True, show_default=True, default=False)
+@click.option(
+    "--skip-broken",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Skip preview files whose status is 'broken' (synced by default).",
+)
+@click.option(
+    "--skip-missing",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Skip preview files whose status is 'missing' (synced by default).",
+)
 def sync_full_files(
     source,
     project,
@@ -635,6 +731,8 @@ def sync_full_files(
     number_workers,
     number_attemps,
     force_resync,
+    skip_broken,
+    skip_missing,
 ):
     """
     Retrieve all files from source instance. It expects that credentials to
@@ -655,6 +753,8 @@ def sync_full_files(
         number_workers=number_workers,
         number_attemps=number_attemps,
         force_resync=force_resync,
+        include_broken=not skip_broken,
+        include_missing=not skip_missing,
     )
     print("Syncing ended.")
     if dict_errors:
@@ -939,6 +1039,7 @@ def create_bot(
     show_default=True,
 )
 @click.option("--all-broken", is_flag=True, default=False, show_default=True)
+@click.option("--all-missing", is_flag=True, default=False, show_default=True)
 @click.option(
     "--all-processing", is_flag=True, default=False, show_default=True
 )
@@ -949,6 +1050,7 @@ def renormalize_movie_preview_files(
     preview_file_id,
     project_id,
     all_broken,
+    all_missing,
     all_processing,
     days=None,
     hours=None,
@@ -964,10 +1066,31 @@ def renormalize_movie_preview_files(
         project_id,
         all_broken,
         all_processing,
+        all_missing=all_missing,
         days=days,
         hours=hours,
         minutes=minutes,
     )
+
+
+@cli.command()
+@click.option(
+    "--project-id",
+    required=False,
+    default=None,
+    show_default=True,
+)
+@click.option("--dry-run", is_flag=True, default=False, show_default=True)
+def normalize_annotation_times(project_id, dry_run):
+    """
+    Merge preview file annotation entries duplicated on the same frame and
+    snap their times onto the player's frame grid. Older Kitsu versions
+    stored unrounded annotation times, leaving entries the player cannot
+    display.
+    """
+    from zou.app.utils import commands
+
+    commands.normalize_annotation_times(project_id=project_id, dry_run=dry_run)
 
 
 @cli.command()

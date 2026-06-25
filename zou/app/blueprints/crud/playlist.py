@@ -3,10 +3,23 @@ from flask_jwt_extended import jwt_required
 from zou.app.models.playlist import Playlist
 from zou.app.models.build_job import BuildJob
 from zou.app.models.notification import Notification
+from zou.app.models.playlist_share_link import PlaylistShareLink
 from zou.app.services import user_service, playlists_service, persons_service
+from zou.app.services.exception import WrongParameterException
 
 from zou.app.blueprints.crud.base import BaseModelResource, BaseModelsResource
 from zou.app.utils import fields
+
+
+def _check_for_entity(data):
+    """
+    Reject unknown for_entity values at the CRUD boundary.
+    """
+    if "for_entity" in data and data["for_entity"] is not None:
+        if data["for_entity"] not in playlists_service.VALID_FOR_ENTITY_VALUES:
+            raise WrongParameterException(
+                f'for_entity must be one of {", ".join(playlists_service.VALID_FOR_ENTITY_VALUES)}'
+            )
 
 
 class PlaylistsResource(BaseModelsResource):
@@ -168,6 +181,7 @@ class PlaylistsResource(BaseModelsResource):
 
     def update_data(self, data):
         data = super().update_data(data)
+        _check_for_entity(data)
         if "episode_id" in data and data["episode_id"] in ["all", "main"]:
             data["episode_id"] = None
         if "task_type_id" in data and not fields.is_valid_id(
@@ -370,11 +384,17 @@ class PlaylistResource(BaseModelResource):
         query = BuildJob.query.filter_by(playlist_id=playlist["id"])
         for job in query.all():
             playlists_service.remove_build_job(playlist, job.id)
+        share_links = PlaylistShareLink.query.filter_by(
+            playlist_id=playlist["id"]
+        ).all()
+        for share_link in share_links:
+            share_link.delete()
 
     def check_update_permissions(self, playlist, data):
         return user_service.check_playlist_update_access(playlist)
 
     def pre_update(self, instance_dict, data):
+        _check_for_entity(data)
         if "shots" in data:
             shots = [
                 {

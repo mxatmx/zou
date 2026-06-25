@@ -223,6 +223,51 @@ class TaskServiceTestCase(ApiDBTestCase):
         self.assertEqual(len(task_types), 1)
         self.assertEqual(task_types[0]["id"], str(self.task_type.id))
 
+    def test_get_task_dicts_for_entity_with_relations_attaches_assignees(
+        self,
+    ):
+        self.generate_fixture_task(name="Secondary")
+        person_id = str(self.person.id)
+        tasks = tasks_service.get_task_dicts_for_entity(
+            self.asset.id, relations=True
+        )
+        self.assertEqual(len(tasks), 2)
+        for task in tasks:
+            self.assertEqual(task["assignees"], [person_id])
+            self.assertTrue(all(isinstance(a, str) for a in task["assignees"]))
+
+    def test_get_task_dicts_for_entity_relations_avoids_n_plus_one(self):
+        from sqlalchemy import event
+        from zou.app import db
+
+        self.generate_fixture_task(name="Secondary")
+        self.generate_fixture_task(name="Tertiary")
+
+        statements = []
+
+        def collect(conn, cursor, statement, *args, **kwargs):
+            statements.append(statement)
+
+        engine = db.session.get_bind()
+        event.listen(engine, "before_cursor_execute", collect)
+        try:
+            tasks = tasks_service.get_task_dicts_for_entity(
+                self.asset.id, relations=True
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", collect)
+
+        self.assertEqual(len(tasks), 3)
+        link_statements = [
+            s for s in statements if "task_person_link" in s.lower()
+        ]
+        self.assertLessEqual(
+            len(link_statements),
+            1,
+            f"Expected at most 1 task_person_link query, got "
+            f"{len(link_statements)}: {link_statements}",
+        )
+
     def test_get_task_dicts_for_entity_utf8(self):
         start_date = fields.get_date_object("2017-02-20")
         due_date = fields.get_date_object("2017-02-28")
@@ -313,7 +358,7 @@ class TaskServiceTestCase(ApiDBTestCase):
             duration=7200
         )
         time_spents = self.get(
-            "/data/time-spents?task_id=%s" % task_id
+            f"/data/time-spents?task_id={task_id}"
         )
         self.assertEqual(
             time_spents["total"],
@@ -512,3 +557,40 @@ class TaskServiceTestCase(ApiDBTestCase):
         for i, preview_file in enumerate(preview_files):
             self.assertEqual(preview_file.position, i + 1)
         self.assertEqual(str(preview_files[2].id), preview_file_id)
+
+
+class GetOrCreateTaskTypeTestCase(ApiDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.department = tasks_service.get_or_create_department(
+            "Concept", "#8D6E63"
+        )
+
+    def test_create_when_missing(self):
+        task_type = tasks_service.get_or_create_task_type(
+            self.department, "Concept", "#8D6E63", 1
+        )
+        self.assertIsNotNone(task_type["id"])
+        self.assertEqual(task_type["for_entity"], "Asset")
+
+    def test_return_existing_with_same_name_and_entity(self):
+        first = tasks_service.get_or_create_task_type(
+            self.department, "Concept", "#8D6E63", 1
+        )
+        second = tasks_service.get_or_create_task_type(
+            self.department, "Concept", "#8D6E63", 1
+        )
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(TaskType.get_all_by(name="Concept")), 1)
+
+    def test_same_name_different_for_entity_coexist(self):
+        asset_type = tasks_service.get_or_create_task_type(
+            self.department, "Concept", "#8D6E63", 1
+        )
+        concept_type = tasks_service.get_or_create_task_type(
+            self.department, "Concept", "#8D6E63", 1, for_entity="Concept"
+        )
+        self.assertNotEqual(asset_type["id"], concept_type["id"])
+        self.assertEqual(asset_type["for_entity"], "Asset")
+        self.assertEqual(concept_type["for_entity"], "Concept")
+        self.assertEqual(len(TaskType.get_all_by(name="Concept")), 2)

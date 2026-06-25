@@ -32,7 +32,7 @@ class EmailsServiceTestCase(ApiDBTestCase):
         self.assertIn("Saludos cordiales", signature_es)
 
     def test_get_task_descriptors(self):
-        (author, task_name, task_url) = emails_service.get_task_descriptors(
+        author, task_name, task_url = emails_service.get_task_descriptors(
             self.person.id, self.task.serialize()
         )
         self.assertEqual(
@@ -40,11 +40,10 @@ class EmailsServiceTestCase(ApiDBTestCase):
         )
         self.assertEqual(
             task_url,
-            "https://localhost:8080/productions/%s/assets/tasks/%s"
-            % (self.project.id, self.task.id),
+            f"https://localhost:8080/productions/{self.project.id}/assets/tasks/{self.task.id}",
         )
         self.generate_fixture_shot_task()
-        (author, task_name, task_url) = emails_service.get_task_descriptors(
+        author, task_name, task_url = emails_service.get_task_descriptors(
             self.person.id, self.shot_task.serialize()
         )
         self.assertEqual(
@@ -52,8 +51,7 @@ class EmailsServiceTestCase(ApiDBTestCase):
         )
         self.assertEqual(
             task_url,
-            "https://localhost:8080/productions/%s/shots/tasks/%s"
-            % (self.project.id, self.shot_task.id),
+            f"https://localhost:8080/productions/{self.project.id}/shots/tasks/{self.shot_task.id}",
         )
 
     def test_send_notification_uses_user_locale(self):

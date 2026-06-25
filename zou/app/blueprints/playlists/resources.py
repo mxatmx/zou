@@ -3,7 +3,6 @@ import slugify
 import os
 
 from flask import (
-    abort,
     after_this_request,
     request,
     send_file as flask_send_file,
@@ -36,6 +35,7 @@ from zou.app.services.exception import (
     BuildJobNotFoundException,
     PlaylistShareLinkNotFoundException,
 )
+from rq.exceptions import DuplicateJobError
 from zou.app.stores import file_store, queue_store
 from zou.app.utils import fs, permissions, validation
 from zou.utils.movie import EncodingParameters
@@ -252,8 +252,10 @@ class ProjectPlaylistResource(Resource):
         """
         user_service.block_access_to_vendor()
         user_service.check_project_access(project_id)
+        # The web client loads annotations on demand, so omit the heavy
+        # annotation blobs from this payload.
         return playlists_service.get_playlist_with_preview_file_revisions(
-            playlist_id
+            playlist_id, with_annotations=False
         )
 
 
@@ -300,9 +302,9 @@ class EntityPreviewsResource(Resource):
                           description: Preview file name
                           example: "preview_v001.png"
         """
-        user_service.block_access_to_vendor()
         entity = entities_service.get_entity(entity_id)
         user_service.check_project_access(entity["project_id"])
+        user_service.check_entity_access(entity_id)
         return playlists_service.get_preview_files_for_entity(entity_id)
 
 
@@ -435,12 +437,10 @@ class PlaylistDownloadResource(Resource):
         context_name = playlists_service.get_playlist_download_context_name(
             project, playlist
         )
-        download_name = "%s_%s_%s.mp4" % (
-            slugify.slugify(build_job["created_at"], separator="").replace(
-                "t", "_"
-            ),
-            context_name,
-            slugify.slugify(playlist["name"], separator="_"),
+        download_name = (
+            f"{slugify.slugify(build_job['created_at'], separator='').replace('t', '_')}"
+            f"_{context_name}_"
+            f"{slugify.slugify(playlist['name'], separator='_')}.mp4"
         )
         return flask_send_file(
             movie_file_path,
@@ -505,7 +505,7 @@ class BuildPlaylistMovieResource(Resource, ArgsMixin):
         user_service.check_manager_project_access(playlist["project_id"])
 
         project = projects_service.get_project(playlist["project_id"])
-        (width, height) = preview_files_service.get_preview_file_dimensions(
+        width, height = preview_files_service.get_preview_file_dimensions(
             project
         )
         fps = preview_files_service.get_preview_file_fps(project)
@@ -528,19 +528,30 @@ class BuildPlaylistMovieResource(Resource, ArgsMixin):
                 }, 400
 
             current_user = persons_service.get_current_user()
-            queue_store.job_queue.enqueue(
-                playlists_service.build_playlist_job,
-                args=(
-                    playlist,
-                    job,
-                    shots,
-                    params,
-                    current_user["email"],
-                    full,
-                    remote,
-                ),
-                job_timeout=int(config.JOB_QUEUE_TIMEOUT),
-            )
+            try:
+                queue_store.job_queue.enqueue(
+                    playlists_service.build_playlist_job,
+                    args=(
+                        playlist,
+                        job,
+                        shots,
+                        params,
+                        current_user["email"],
+                        full,
+                        remote,
+                    ),
+                    job_timeout=int(config.JOB_QUEUE_TIMEOUT),
+                    unique=True,
+                    job_id=f"build_playlist_{playlist['id']}",
+                    result_ttl=60,
+                    failure_ttl=60,
+                )
+            except DuplicateJobError:
+                playlists_service.remove_build_job(playlist, job["id"])
+                return {
+                    "error": True,
+                    "message": "A build is already in progress for this playlist",
+                }, 409
             return job
         else:
             job = playlists_service.build_playlist_movie_file(
@@ -586,9 +597,9 @@ class PlaylistZipDownloadResource(Resource):
         context_name = playlists_service.get_playlist_download_context_name(
             project, playlist
         )
-        download_name = "%s_%s.zip" % (
-            context_name,
-            slugify.slugify(playlist["name"], separator="_"),
+        download_name = (
+            f"{context_name}_"
+            f"{slugify.slugify(playlist['name'], separator='_')}.zip"
         )
 
         @after_this_request
@@ -871,10 +882,11 @@ class TempPlaylistResource(Resource, ArgsMixin):
           400:
             description: Invalid task IDs
         """
-        user_service.block_access_to_vendor()
         user_service.check_project_access(project_id)
         body = validation.validate_request_body(TempPlaylistCreateSchema)
         task_ids = [str(t) for t in body.task_ids]
+        for task_id in task_ids:
+            user_service.check_task_access(task_id)
         sort = self.get_bool_parameter("sort")
         return (
             playlists_service.generate_temp_playlist(task_ids, sort=sort) or []

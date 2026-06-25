@@ -5,23 +5,11 @@ Zou is the REST API backend for **Kitsu**, a production management tool for anim
 ## Quick Reference
 
 ```bash
-# Activate env
-source ~/.virtualenvs/zou/bin/activate
-
-# Run tests (requires PostgreSQL on localhost:5432)
-DB_DATABASE=zoudb-test py.test tests/path/to/test_file.py -v
-
-# Run full test suite
-DB_DATABASE=zoudb-test py.test tests/ -v
-
 # Lint / format
 pre-commit run --all-files
 
 # Generate a migration
 zou migrate-db --message "Add column X to table Y"
-
-# Apply migrations
-zou upgrade-db
 ```
 
 ## Architecture
@@ -78,6 +66,24 @@ HTTP → Flask routing → Resource method → @jwt_required()
 - Services are **module-level functions**, not classes
 - Models inherit `db.Model, BaseMixin, SerializerMixin`
 - UUIDs everywhere for primary keys (`UUIDType(binary=False)`)
+- **String formatting: f-strings only** for any new or edited code. Do not introduce `"... %s" % x` or `.format(...)`. Pre-existing `%`-formatted lines in a file you're editing can stay — don't scope-creep — but every new line you add should use f-strings.
+- **Docstrings: opening and closing `"""` each on their own line.** Always put a newline immediately after the opening `"""` and immediately before the closing `"""`, even for one-liners. Do not write `"""Summary on the same line."""` or `"""First line\n    second line."""`.
+
+  ```python
+  # Wrong
+  """Return the task or None."""
+  """Common flow for bulk download: check permissions,
+  build the bundle, send it as attachment."""
+
+  # Right
+  """
+  Return the task or None.
+  """
+  """
+  Common flow for bulk download: check permissions,
+  build the bundle, send it as attachment.
+  """
+  ```
 
 ### Naming
 - Model class: `PascalCase` (e.g., `TaskStatus`)
@@ -244,14 +250,7 @@ Format: `<table_name>:<action>` — e.g., `task:new`, `comment:delete`, `person:
 
 ## Testing
 
-### Running tests
-
-```bash
-source ~/.virtualenvs/zou/bin/activate
-DB_DATABASE=zoudb-test py.test tests/services/test_my_service.py -v
-```
-
-Requires PostgreSQL running locally on port 5432. The test DB is created/dropped automatically by `conftest.py`.
+See `CLAUDE.local.md` for how to run tests locally. The test DB schema is created/dropped automatically by `conftest.py`.
 
 ### Test base class
 
@@ -325,7 +324,6 @@ class MyServiceTestCase(ApiDBTestCase):
 ```
 
 ## Migrations
-
 ```bash
 # Generate
 zou migrate-db --message "Add column X to table Y"
@@ -335,9 +333,10 @@ zou upgrade-db
 
 # Rollback one step
 zou downgrade-db --revision "-1"
-```
 
 Migrations live in `zou/migrations/versions/`. Each file has `upgrade()` and `downgrade()` functions. Use `UUIDType(binary=False)` for UUID columns.
+
+See `CLAUDE.local.md` for `zou migrate-db` / `zou upgrade-db` / `zou downgrade-db` invocations.
 
 ## Key Environment Variables
 

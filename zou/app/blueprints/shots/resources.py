@@ -1041,6 +1041,7 @@ class ShotsAndTasksResource(Resource):
                                   example: SH010 Animation
         """
         criterions = query.get_query_criterions_from_request(request)
+        query.check_criterion_id_format(criterions)
         user_service.check_project_access(criterions.get("project_id", None))
         if permissions.has_vendor_permissions():
             criterions["assigned_to"] = persons_service.get_current_user()[
@@ -1104,6 +1105,9 @@ class SceneAndTasksResource(Resource):
                                   example: Layout
         """
         criterions = query.get_query_criterions_from_request(request)
+        query.check_criterion_id_format(
+            criterions, ["project_id", "episode_id"]
+        )
         user_service.check_project_access(criterions.get("project_id", None))
         if permissions.has_vendor_permissions():
             raise permissions.PermissionDenied
@@ -1163,10 +1167,28 @@ class SequenceAndTasksResource(Resource):
                                   example: SQ010 Editing
         """
         criterions = query.get_query_criterions_from_request(request)
+        query.check_criterion_id_format(
+            criterions, ["project_id", "episode_id"]
+        )
         user_service.check_project_access(criterions.get("project_id", None))
-        if permissions.has_vendor_permissions():
-            raise permissions.PermissionDenied
         criterions["entity_type_id"] = shots_service.get_sequence_type()["id"]
+        if permissions.has_vendor_permissions():
+            # Vendors only see sequences holding a shot with a task assigned
+            # to them, and only their own tasks on those sequences.
+            if criterions.get("episode_id"):
+                sequences = shots_service.get_sequences_for_episode(
+                    criterions["episode_id"], only_assigned=True
+                )
+            else:
+                sequences = shots_service.get_sequences_for_project(
+                    criterions["project_id"], only_assigned=True
+                )
+            criterions["entity_ids"] = [
+                sequence["id"] for sequence in sequences
+            ]
+            criterions["assigned_to"] = persons_service.get_current_user()[
+                "id"
+            ]
         return entities_service.get_entities_and_tasks(criterions)
 
 
@@ -1222,10 +1244,21 @@ class EpisodeAndTasksResource(Resource):
                                   example: EP01 Layout
         """
         criterions = query.get_query_criterions_from_request(request)
+        query.check_criterion_id_format(
+            criterions, ["project_id", "episode_id"]
+        )
         user_service.check_project_access(criterions.get("project_id", None))
-        if permissions.has_vendor_permissions():
-            raise permissions.PermissionDenied
         criterions["entity_type_id"] = shots_service.get_episode_type()["id"]
+        if permissions.has_vendor_permissions():
+            # Vendors only see episodes holding a shot with a task assigned
+            # to them, and only their own tasks on those episodes.
+            episodes = shots_service.get_episodes_for_project(
+                criterions["project_id"], only_assigned=True
+            )
+            criterions["entity_ids"] = [episode["id"] for episode in episodes]
+            criterions["assigned_to"] = persons_service.get_current_user()[
+                "id"
+            ]
         return entities_service.get_entities_and_tasks(criterions)
 
 

@@ -95,12 +95,12 @@ class CommentsServiceTestCase(ApiDBTestCase):
         retake_status = self.generate_fixture_task_status_retake().serialize()
         task = self.task.serialize()
         comment = self.comment
-        (task, status_changed) = comments_service._manage_status_change(
+        task, status_changed = comments_service._manage_status_change(
             task_status, task, comment
         )
         self.assertFalse(status_changed)
         self.assertEqual(task["retake_count"], 0)
-        (task, status_changed) = comments_service._manage_status_change(
+        task, status_changed = comments_service._manage_status_change(
             retake_status, task, comment
         )
         self.assertTrue(status_changed)
@@ -113,14 +113,14 @@ class CommentsServiceTestCase(ApiDBTestCase):
             "old comment",
             created_at="1999-12-23 10:00:00",
         )
-        (task, status_changed) = comments_service._manage_status_change(
+        task, status_changed = comments_service._manage_status_change(
             retake_status, task, old_comment
         )
 
         self.assertFalse(status_changed)
         self.assertEqual(task["retake_count"], 1)
 
-        (task, status_changed) = comments_service._manage_status_change(
+        task, status_changed = comments_service._manage_status_change(
             self.wfa_status, task, comment
         )
         self.assertTrue(task["end_date"] is not None)
@@ -156,9 +156,7 @@ class CommentsServiceTestCase(ApiDBTestCase):
         self.assertEqual(len(self.fired_events), 1)
         payload = self.fired_events[0]
         self.assertEqual(payload["task_id"], str(self.task.id))
-        self.assertEqual(
-            payload["new_task_status_id"], self.wfa_status["id"]
-        )
+        self.assertEqual(payload["new_task_status_id"], self.wfa_status["id"])
         self.assertEqual(payload["comment_id"], comment["id"])
 
     def test_manage_subscriptions(self):
@@ -401,7 +399,9 @@ class CommentsServiceTestCase(ApiDBTestCase):
         self.assertEqual(len(filtered), 0)
 
     def test_create_comment_with_hashtags(self):
-        """Integration test for create_comment with hashtag functionality"""
+        """
+        Integration test for create_comment with hashtag functionality
+        """
         modeling_task = self.generate_fixture_shot_task(
             name="main", task_type_id=self.task_type_modeling.id
         )

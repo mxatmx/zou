@@ -1,4 +1,10 @@
-from werkzeug.exceptions import NotFound, Forbidden, BadRequest, Unauthorized
+from werkzeug.exceptions import (
+    NotFound,
+    Forbidden,
+    BadRequest,
+    Unauthorized,
+    ServiceUnavailable,
+)
 
 
 class EpisodeNotFoundException(NotFound):
@@ -109,7 +115,19 @@ class PreviewFileReuploadNotAllowedException(BadRequest):
     pass
 
 
+class AnnotationLockTimeoutException(ServiceUnavailable):
+    pass
+
+
+class AnnotationNotFoundException(BadRequest):
+    pass
+
+
 class RevisionAlreadyExistsException(BadRequest):
+    pass
+
+
+class TooManyPreviewFilesException(BadRequest):
     pass
 
 
@@ -264,8 +282,6 @@ class TwoFactorAuthenticationRequiredException(Exception):
     Exception raised when 2FA is enforced but user has not set it up.
     """
 
-    pass
-
 
 class TooMuchLoginFailedAttemps(Exception):
     pass
@@ -288,6 +304,18 @@ class EntryAlreadyExistsException(Exception):
 
 
 class WrongParameterException(Exception):
+    def __init__(self, message, dict=None):
+        super().__init__(message)
+        self.dict = dict
+
+
+class PreviewProcessingFailedException(Exception):
+    """
+    Raised when a preview file could not be processed server-side
+    (e.g. ffmpeg normalization or file storage failure). This is an
+    internal failure, not a client error.
+    """
+
     def __init__(self, message, dict=None):
         super().__init__(message)
         self.dict = dict

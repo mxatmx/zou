@@ -26,8 +26,10 @@ from zou.app.services import (
     sync_service,
     tasks_service,
 )
+from zou.app.models.entity import Entity
 from zou.app.models.person import Person
 from zou.app.models.preview_file import PreviewFile
+from zou.app.models.project import Project
 from zou.app.models.task import Task
 from zou.app.models.plugin import Plugin
 from sqlalchemy.sql.expression import not_
@@ -61,7 +63,9 @@ def clear_all_auth_tokens():
 
 
 def _init_asset_types_for_domain(domain):
-    """Initialize asset types according to domain (2d, 3d, vfx, games)."""
+    """
+    Initialize asset types according to domain (2d, 3d, vfx, games).
+    """
     if domain == "2d":
         for name in ("Character", "Prop", "Background", "FX"):
             assets_service.get_or_create_asset_type(name)
@@ -78,7 +82,9 @@ def _init_asset_types_for_domain(domain):
 
 
 def _init_task_types_for_domain(domain):
-    """Initialize departments and task types according to domain."""
+    """
+    Initialize departments and task types according to domain.
+    """
     if domain == "2d":
         concept = tasks_service.get_or_create_department("Concept", "#8D6E63")
         layout = tasks_service.get_or_create_department("Layout", "#7CB342")
@@ -478,7 +484,7 @@ def sync_with_ldap_server():
 
                 emails = entry.mail.values
                 if len(emails) == 0:
-                    emails = ["%s@%s" % (desktop_login, EMAIL_DOMAIN)]
+                    emails = [f"{desktop_login}@{EMAIL_DOMAIN}"]
                 else:
 
                     def sort_mails(email):
@@ -577,9 +583,7 @@ def sync_with_ldap_server():
             persons_service.update_person(
                 person.id, {"active": False}, bypass_protected_accounts=True
             )
-            print(
-                "User %s disabled (not found in LDAP)." % person.desktop_login
-            )
+            print(f"User {person.desktop_login} disabled (not found in LDAP).")
 
         for person, user in persons_to_update:
             try:
@@ -694,6 +698,53 @@ def import_data_from_another_instance(
             )
 
 
+def verify_project_against_source(source, login, password, project_name):
+    """
+    Connect to the source instance and compare row counts for every
+    project-scoped model. Prints a side-by-side report and a non-zero
+    exit code is not used — the report is informational.
+    """
+    with app.app_context():
+        sync_service.init(source, login, password)
+        sync_service.verify_project_sync(project_name, direction="pull")
+
+
+def verify_project_against_target(target, login, password, project_name):
+    """
+    Mirror of :func:`verify_project_against_source` for the sync-push
+    direction. Connect to the target instance we pushed to and compare
+    its row counts against the local ones.
+    """
+    with app.app_context():
+        sync_service.init(target, login, password)
+        sync_service.verify_project_sync(project_name, direction="push")
+
+
+def push_project_to_target(
+    target,
+    login,
+    password,
+    project_name,
+    batch_size=200,
+    throttle=0.0,
+    silent=True,
+):
+    """
+    Push the project named ``project_name`` from the local instance to
+    ``target`` via /import/kitsu/* routes.
+    """
+    with app.app_context():
+        sync_service.push_project_data(
+            target,
+            login,
+            password,
+            project_name,
+            batch_size=batch_size,
+            throttle=throttle,
+            silent=silent,
+        )
+
+
 def run_sync_change_daemon(event_source, source, login, password, logs_dir):
     """
     Listen to event websocket. Each time a change occurs, it retrieves the
@@ -764,6 +815,8 @@ def import_files_from_another_instance(
     number_workers=30,
     number_attemps=3,
     force_resync=False,
+    include_broken=True,
+    include_missing=True,
 ):
     """
     Retrieve and save all the data related most recent events from another API
@@ -779,6 +832,8 @@ def import_files_from_another_instance(
             number_workers=number_workers,
             number_attemps=number_attemps,
             force_resync=force_resync,
+            include_broken=include_broken,
+            include_missing=include_missing,
         )
 
 
@@ -826,7 +881,7 @@ def reset_tasks_data(project_id):
 
 def remove_old_data(days_old=90):
     with app.app_context():
-        print("Start removing non critical data older than %s." % days_old)
+        print(f"Start removing non critical data older than {days_old}.")
         print("Removing old events...")
         deletion_service.remove_old_events(days_old)
         print("Removing old login logs...")
@@ -917,19 +972,33 @@ def create_bot(
         print(bot["access_token"])
 
 
+class _SourceMovieMissing(RuntimeError):
+    """
+    Raised when the source movie binary is gone from storage during a
+    renormalize pass. Used to distinguish 'broken' from 'missing' status.
+    """
+
+
 def renormalize_movie_preview_files(
     preview_file_id=None,
     project_id=None,
     all_broken=None,
     all_processing=None,
+    all_missing=None,
     days=None,
     hours=None,
     minutes=None,
 ):
     with app.app_context():
-        if preview_file_id is None and not all_broken and not all_processing:
+        if (
+            preview_file_id is None
+            and not all_broken
+            and not all_processing
+            and not all_missing
+        ):
             print(
-                "You must specify at least one flag from --all-broken or --all-processing."
+                "You must specify at least one flag from --all-broken, "
+                "--all-missing or --all-processing."
             )
             sys.exit(1)
 
@@ -953,14 +1022,15 @@ def renormalize_movie_preview_files(
                 PreviewFile.project_id == project_id
             )
 
-        if all_broken and all_processing:
-            query = query.filter(
-                PreviewFile.status.in_(("broken", "processing"))
-            )
-        elif all_broken:
-            query = query.filter(PreviewFile.status == "broken")
-        elif all_processing:
-            query = query.filter(PreviewFile.status == "processing")
+        selected_statuses = []
+        if all_broken:
+            selected_statuses.append("broken")
+        if all_missing:
+            selected_statuses.append("missing")
+        if all_processing:
+            selected_statuses.append("processing")
+        if selected_statuses:
+            query = query.filter(PreviewFile.status.in_(selected_statuses))
 
         preview_files = query.all()
         len_preview_files = len(preview_files)
@@ -979,23 +1049,34 @@ def renormalize_movie_preview_files(
                         config.TMP_DIR,
                         f"{preview_file_id}.{extension}.tmp",
                     )
-                    try:
-                        if config.FS_BACKEND == "local":
-                            shutil.copyfile(
-                                file_store.get_local_movie_path(
-                                    "source", preview_file_id
-                                ),
-                                uploaded_movie_path,
-                            )
-                        else:
-                            sync_service.download_file(
-                                uploaded_movie_path,
-                                "source",
-                                file_store.open_movie,
-                                str(preview_file_id),
-                            )
-                    except Exception:
-                        pass
+                    if not file_store.exists_movie("source", preview_file_id):
+                        raise _SourceMovieMissing(
+                            f"Source movie missing in storage for preview "
+                            f"{preview_file_id}; skipping renormalization."
+                        )
+                    if config.FS_BACKEND == "local":
+                        shutil.copyfile(
+                            file_store.get_local_movie_path(
+                                "source", preview_file_id
+                            ),
+                            uploaded_movie_path,
+                        )
+                    else:
+                        sync_service.download_file(
+                            uploaded_movie_path,
+                            "source",
+                            file_store.open_movie,
+                            str(preview_file_id),
+                        )
+                    if (
+                        not os.path.exists(uploaded_movie_path)
+                        or os.path.getsize(uploaded_movie_path) == 0
+                    ):
+                        raise RuntimeError(
+                            f"Local copy of source movie is missing or "
+                            f"empty at {uploaded_movie_path}; skipping "
+                            f"renormalization of {preview_file_id}."
+                        )
                     if config.ENABLE_JOB_QUEUE:
                         queue_store.job_queue.enqueue(
                             preview_files_service.prepare_and_store_movie,
@@ -1014,11 +1095,89 @@ def renormalize_movie_preview_files(
                             normalize=True,
                             add_source_to_file_store=False,
                         )
+                except _SourceMovieMissing as e:
+                    print(
+                        f"Renormalization of preview file {preview_file_id} failed: {e}"
+                    )
+                    try:
+                        preview_files_service.set_preview_file_as_missing(
+                            preview_file_id
+                        )
+                    except Exception as mark_err:
+                        print(
+                            f"Could not mark {preview_file_id} as missing: {mark_err}"
+                        )
+                    continue
                 except Exception as e:
                     print(
                         f"Renormalization of preview file {preview_file_id} failed: {e}"
                     )
+                    try:
+                        preview_files_service.set_preview_file_as_broken(
+                            preview_file_id
+                        )
+                    except Exception as mark_err:
+                        print(
+                            f"Could not mark {preview_file_id} as broken: {mark_err}"
+                        )
                     continue
+
+
+def normalize_annotation_times(project_id=None, dry_run=False):
+    """
+    Merge preview file annotation entries that land on the same frame and
+    snap their times onto the frame grid used by the Kitsu player. Older
+    Kitsu versions stored unrounded times, leaving duplicated entries whose
+    drawings the player cannot display.
+    """
+    with app.app_context():
+        query = PreviewFile.query.filter(
+            PreviewFile.annotations.isnot(None)
+        ).order_by(PreviewFile.created_at.asc())
+        if project_id is not None:
+            query = query.join(Task).filter(Task.project_id == project_id)
+        changed_count = 0
+        scanned_count = 0
+        for preview_file in query:
+            if not preview_file.annotations:
+                continue
+            scanned_count += 1
+            preview_file_id = str(preview_file.id)
+            try:
+                if dry_run:
+                    task = Task.get(preview_file.task_id)
+                    project = Project.get(task.project_id).serialize()
+                    entity = Entity.get(task.entity_id)
+                    fps = float(
+                        preview_files_service.get_preview_file_fps(
+                            project,
+                            entity.serialize() if entity is not None else None,
+                        )
+                    )
+                    _, changed = (
+                        preview_files_service.normalize_annotation_times(
+                            preview_file.annotations, fps
+                        )
+                    )
+                else:
+                    changed = preview_files_service.normalize_preview_file_annotation_times(
+                        preview_file
+                    )
+                if changed:
+                    changed_count += 1
+                    print(
+                        f"Preview file {preview_file_id} "
+                        f"{'needs normalization' if dry_run else 'normalized'}."
+                    )
+            except Exception as e:
+                print(
+                    f"Normalization of preview file {preview_file_id} "
+                    f"failed: {e}"
+                )
+        print(
+            f"{changed_count}/{scanned_count} annotated preview files "
+            f"{'need normalization' if dry_run else 'normalized'}."
+        )
 
 
 def list_plugins(output_format, verbose, filter_field, filter_value):

@@ -11,7 +11,6 @@ from zou.app.services.exception import (
 )
 from zou.app.utils import permissions
 
-
 # ---------------------------------------------------------------------------
 # Link management
 # ---------------------------------------------------------------------------
@@ -215,10 +214,8 @@ class ProjectTemplateStatusAutomationsResource(Resource, ArgsMixin):
         """
         permissions.check_manager_permissions()
         try:
-            return (
-                project_templates_service.get_template_status_automations(
-                    template_id
-                )
+            return project_templates_service.get_template_status_automations(
+                template_id
             )
         except ProjectTemplateNotFoundException:
             return {"message": "Project template not found"}, 404
@@ -276,10 +273,8 @@ class ProjectTemplateBackgroundsResource(Resource, ArgsMixin):
         """
         permissions.check_manager_permissions()
         try:
-            return (
-                project_templates_service.get_template_preview_background_files(
-                    template_id
-                )
+            return project_templates_service.get_template_preview_background_files(
+                template_id
             )
         except ProjectTemplateNotFoundException:
             return {"message": "Project template not found"}, 404
@@ -295,10 +290,8 @@ class ProjectTemplateBackgroundsResource(Resource, ArgsMixin):
         permissions.check_admin_permissions()
         args = self.get_args([("preview_background_file_id", "", True)])
         try:
-            entry = (
-                project_templates_service.add_preview_background_file_to_template(
-                    template_id, args["preview_background_file_id"]
-                )
+            entry = project_templates_service.add_preview_background_file_to_template(
+                template_id, args["preview_background_file_id"]
             )
         except ProjectTemplateNotFoundException:
             return {"message": "Project template not found"}, 404
@@ -339,10 +332,8 @@ class ProjectTemplateDefaultBackgroundResource(Resource):
         data = request.json or {}
         background_id = data.get("default_preview_background_file_id")
         try:
-            template = (
-                project_templates_service.set_template_default_preview_background_file(
-                    template_id, background_id
-                )
+            template = project_templates_service.set_template_default_preview_background_file(
+                template_id, background_id
             )
         except ProjectTemplateNotFoundException:
             return {"message": "Project template not found"}, 404
@@ -402,12 +393,10 @@ class ProjectTemplateFromProjectResource(Resource, ArgsMixin):
             ]
         )
         try:
-            template = (
-                project_templates_service.create_template_from_project(
-                    project_id,
-                    args["name"],
-                    description=args["description"],
-                )
+            template = project_templates_service.create_template_from_project(
+                project_id,
+                args["name"],
+                description=args["description"],
             )
         except ProjectNotFoundException:
             return {"message": "Project not found"}, 404

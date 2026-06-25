@@ -41,13 +41,13 @@ class NewsRoutesTestCase(ApiDBTestCase):
                 self.task.id,
                 self.task_status.id,
                 self.user["id"],
-                "comment %s" % i,
+                f"comment {i}",
             )
             news = news_service.create_news_for_task_and_comment(
                 self.task_dict, comment
             )
         news_list = self.get(
-            "/data/projects/%s/news" % self.task_dict["project_id"]
+            f"/data/projects/{self.task_dict['project_id']}/news"
         )
         self.assertEqual(len(news_list["data"]), 50)
         news = news_list["data"][0]
@@ -56,13 +56,12 @@ class NewsRoutesTestCase(ApiDBTestCase):
         self.assertEqual(news["project_id"], self.task_dict["project_id"])
 
         news_list = self.get(
-            "/data/projects/%s/news?page=2" % self.task_dict["project_id"]
+            f"/data/projects/{self.task_dict['project_id']}/news?page=2"
         )
         self.assertEqual(len(news_list["data"]), 30)
 
         news = self.get(
-            "/data/projects/%s/news/%s"
-            % (self.task_dict["project_id"], news["id"])
+            f"/data/projects/{self.task_dict['project_id']}/news/{news['id']}"
         )
         self.assertIsNotNone(news["created_at"])
 
@@ -73,3 +72,16 @@ class NewsRoutesTestCase(ApiDBTestCase):
         )
         news_list = self.get("/data/projects/news")
         self.assertEqual(len(news_list["data"]), 1)
+
+    def test_news_embeds_author(self):
+        self.generate_fixture_comment()
+        news_service.create_news_for_task_and_comment(
+            self.task_dict, self.comment
+        )
+        news_list = self.get(
+            "/data/projects/%s/news" % self.task_dict["project_id"]
+        )
+        news = news_list["data"][0]
+        self.assertEqual(news["person"]["id"], news["author_id"])
+        self.assertEqual(news["person"]["full_name"], "John Did")
+        self.assertIn("has_avatar", news["person"])

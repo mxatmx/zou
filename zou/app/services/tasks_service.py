@@ -19,11 +19,11 @@ from zou.app.models.comment import (
 )
 from zou.app.models.department import Department
 from zou.app.models.entity import Entity, EntityLink
-from zou.app.models.entity_type import EntityType
+from zou.app.models.entity_type import EntityType, TaskTypeAssetTypeLink
 from zou.app.models.news import News
 from zou.app.models.person import Person
 from zou.app.models.preview_file import PreviewFile
-from zou.app.models.project import Project
+from zou.app.models.project import Project, ProjectTaskTypeLink
 from zou.app.models.project_status import ProjectStatus
 from zou.app.models.task import Task, TaskPersonLink
 from zou.app.models.task_type import TaskType
@@ -45,9 +45,11 @@ from zou.app.services.exception import (
     EpisodeNotFoundException,
     PersonNotFoundException,
     RevisionAlreadyExistsException,
+    TooManyPreviewFilesException,
     TaskNotFoundException,
     TaskStatusNotFoundException,
     TaskTypeNotFoundException,
+    WrongParameterException,
     DepartmentNotFoundException,
     StudioNotFoundException,
     WrongDateFormatException,
@@ -358,11 +360,8 @@ def get_task_dicts_for_entity(entity_id, relations=True):
 
 
 def _get_entity_task_query(relations=False):
-    query = Task.query
-    if relations:
-        query = query.options(selectinload(Task.assignees))
     return (
-        query.order_by(Task.name)
+        Task.query.order_by(Task.name)
         .join(Project, Task.project_id == Project.id)
         .join(TaskType, Task.task_type_id == TaskType.id)
         .join(TaskStatus, TaskStatus.id == Task.task_status_id)
@@ -378,9 +377,9 @@ def _get_entity_task_query(relations=False):
 
 
 def _convert_rows_to_detailed_tasks(rows, relations=False):
-    return [
+    task_dicts = [
         {
-            **task_object.serialize(relations=relations),
+            **task_object.serialize(relations=False),
             "project_name": project_name,
             "task_type_name": task_type_name,
             "task_status_name": task_status_name,
@@ -389,6 +388,28 @@ def _convert_rows_to_detailed_tasks(rows, relations=False):
         }
         for task_object, project_name, task_type_name, task_status_name, entity_type_name, entity_name in rows
     ]
+    if relations and task_dicts:
+        _attach_assignee_ids(task_dicts)
+    return task_dicts
+
+
+def _attach_assignee_ids(task_dicts):
+    """
+    Fetch all assignees for the given tasks in a single query and inject the
+    list of person ids into each dict. Avoids the N+1 that occurs when each
+    Task row triggers a separate lazy load of its assignees relationship.
+    """
+    task_ids = [task["id"] for task in task_dicts]
+    links = (
+        db.session.query(TaskPersonLink.task_id, TaskPersonLink.person_id)
+        .filter(TaskPersonLink.task_id.in_(task_ids))
+        .all()
+    )
+    assignees_by_task = collections.defaultdict(list)
+    for task_id, person_id in links:
+        assignees_by_task[str(task_id)].append(str(person_id))
+    for task in task_dicts:
+        task["assignees"] = assignees_by_task.get(task["id"], [])
 
 
 def _resolve_episode_and_build_task_dict(
@@ -651,6 +672,7 @@ def get_comments(task_id, is_client=False, is_manager=False):
             comment["attachment_files"] = attachment_file_map.get(
                 comment["id"], []
             )
+        embed_reply_authors(comments, is_client=is_client)
 
     if is_client:
         tmp_comments = []
@@ -668,6 +690,14 @@ def get_comments(task_id, is_client=False, is_manager=False):
             person = persons_map.get(comment["person_id"], {})
             is_author = comment["person_id"] == current_user["id"]
             is_author_client = person.get("role") == "client"
+            # Hide studio members' identities from clients, like replies.
+            if not is_author_client:
+                comment["person"] = None
+            # Hide the editor identity too when a studio member edited it.
+            editor = comment.get("editor")
+            if editor and editor.get("role") != "client":
+                comment["editor"] = None
+                comment["editor_id"] = None
             is_for_client = comment.get("for_client", False)
             is_allowed = (
                 is_for_client
@@ -704,15 +734,43 @@ def _prepare_query(task_id, is_client, is_manager):
             TaskStatus.color,
             Person.first_name,
             Person.last_name,
+            Person.full_name,
             Person.has_avatar,
+            Person.role,
             Editor.first_name,
             Editor.last_name,
             Editor.has_avatar,
+            Editor.role,
         )
     )
     if not is_manager and not is_client:
         query = query.filter(Person.role != "client")
     return query
+
+
+def embed_reply_authors(comments, is_client=False):
+    """
+    Attach a minimal author to each reply so guest repliers render too.
+
+    For clients, only client authors are embedded to keep studio members'
+    identities hidden, matching the comment author behavior.
+
+    """
+    reply_person_ids = {
+        reply.get("person_id")
+        for comment in comments
+        for reply in (comment.get("replies") or [])
+        if reply.get("person_id")
+    }
+    if not reply_person_ids:
+        return
+    persons_map = persons_service.get_short_persons_map(list(reply_person_ids))
+    for comment in comments:
+        for reply in comment.get("replies") or []:
+            author = persons_map.get(reply.get("person_id"))
+            if is_client and author and author.get("role") != "client":
+                author = None
+            reply["person"] = author
 
 
 def _run_task_comments_query(query):
@@ -726,17 +784,22 @@ def _run_task_comments_query(query):
             task_status_color,
             person_first_name,
             person_last_name,
+            person_full_name,
             person_has_avatar,
+            person_role,
             editor_first_name,
             editor_last_name,
             editor_has_avatar,
+            editor_role,
         ) = result
 
         comment_dict = comment.serialize()
         comment_dict["person"] = {
             "first_name": person_first_name,
             "last_name": person_last_name,
+            "full_name": person_full_name,
             "has_avatar": person_has_avatar,
+            "role": getattr(person_role, "code", person_role),
             "id": str(comment.person_id),
         }
         if comment.editor_id is not None:
@@ -744,6 +807,7 @@ def _run_task_comments_query(query):
                 "first_name": editor_first_name,
                 "last_name": editor_last_name,
                 "has_avatar": editor_has_avatar,
+                "role": getattr(editor_role, "code", editor_role),
                 "id": str(comment.editor_id),
             }
         comment_dict["task_status"] = {
@@ -1159,19 +1223,41 @@ def get_last_comment_map(task_ids):
     return task_comment_map
 
 
+def _build_task_no_commit(task_type, task_status, entity, current_user_id):
+    """
+    Insert a new task (without committing) using the zou defaults for
+    name, durations, dates and assignees.
+    """
+    return Task.create_no_commit(
+        name="main",
+        duration=0,
+        estimation=0,
+        completion_rate=0,
+        start_date=None,
+        end_date=None,
+        due_date=None,
+        real_start_date=None,
+        project_id=entity["project_id"],
+        task_type_id=task_type["id"],
+        task_status_id=task_status["id"],
+        entity_id=entity["id"],
+        assigner_id=current_user_id,
+        assignees=[],
+    )
+
+
 def create_tasks(task_type, entities):
     """
     Create a new task for given task type and for each entity.
     """
+    if not entities:
+        return []
+
     current_user_id = None
     try:
         current_user_id = persons_service.get_current_user()["id"]
     except RuntimeError:
         pass
-
-    # Batch query existing tasks to avoid N+1 query problem
-    if not entities:
-        return []
 
     entity_ids = [entity["id"] for entity in entities]
     existing_tasks = Task.query.filter(
@@ -1187,31 +1273,122 @@ def create_tasks(task_type, entities):
     tasks = []
     for entity in entities:
         if str(entity["id"]) not in existing_entity_ids:
-            task = Task.create_no_commit(
-                name="main",
-                duration=0,
-                estimation=0,
-                completion_rate=0,
-                start_date=None,
-                end_date=None,
-                due_date=None,
-                real_start_date=None,
-                project_id=entity["project_id"],
-                task_type_id=task_type["id"],
-                task_status_id=task_status["id"],
-                entity_id=entity["id"],
-                assigner_id=current_user_id,
-                assignees=[],
+            tasks.append(
+                _build_task_no_commit(
+                    task_type, task_status, entity, current_user_id
+                )
             )
-            tasks.append(task)
     Task.commit()
 
-    task_dicts = []
-    for task in tasks:
-        task_dict = _finalize_task_creation(task_type, task_status, task)
-        task_dicts.append(task_dict)
+    return [
+        _finalize_task_creation(task_type, task_status, task) for task in tasks
+    ]
 
-    return task_dicts
+
+def create_tasks_for_entity(entity, task_types=None):
+    """
+    Create tasks of multiple types for a single entity in one batch.
+    When task_types is empty or None, default to every task type valid
+    for the entity: enabled in the project, in the asset-type workflow
+    (for assets), and whose for_entity matches the entity kind. When a
+    list is provided, each task type is validated against those same
+    constraints. Existing tasks for the same (entity, task_type,
+    name="main") are skipped.
+    """
+    project_id = entity["project_id"]
+    is_asset = assets_service.is_asset_dict(entity)
+    if is_asset:
+        entity_kind = "Asset"
+    else:
+        entity_type = entities_service.get_entity_type(
+            entity["entity_type_id"]
+        )
+        entity_kind = entity_type["name"]
+
+    enabled_in_project = {
+        str(link.task_type_id)
+        for link in ProjectTaskTypeLink.query.filter(
+            ProjectTaskTypeLink.project_id == project_id
+        ).all()
+    }
+    enabled_in_workflow = None
+    if is_asset:
+        enabled_in_workflow = {
+            str(link.task_type_id)
+            for link in TaskTypeAssetTypeLink.query.filter(
+                TaskTypeAssetTypeLink.asset_type_id == entity["entity_type_id"]
+            ).all()
+        }
+
+    if not task_types:
+        candidate_ids = enabled_in_project
+        if is_asset:
+            candidate_ids = candidate_ids & enabled_in_workflow
+        if not candidate_ids:
+            return []
+        task_types = [
+            task_type.serialize()
+            for task_type in TaskType.query.filter(
+                TaskType.id.in_(candidate_ids)
+            ).all()
+            if not task_type.for_entity or task_type.for_entity == entity_kind
+        ]
+        if not task_types:
+            return []
+    else:
+        for task_type in task_types:
+            type_id = task_type["id"]
+            expected = task_type.get("for_entity")
+            if expected and expected != entity_kind:
+                raise WrongParameterException(
+                    f"Task type {type_id} is for {expected} entities, "
+                    f"got {entity_kind}."
+                )
+            if str(type_id) not in enabled_in_project:
+                raise WrongParameterException(
+                    f"Task type {type_id} is not enabled in project "
+                    f"{project_id}."
+                )
+            if is_asset and str(type_id) not in enabled_in_workflow:
+                raise WrongParameterException(
+                    f"Task type {type_id} is not in the workflow of "
+                    f"asset type {entity['entity_type_id']}."
+                )
+
+    type_ids = [task_type["id"] for task_type in task_types]
+    existing_type_ids = {
+        str(task.task_type_id)
+        for task in Task.query.filter(
+            Task.entity_id == entity["id"],
+            Task.task_type_id.in_(type_ids),
+            Task.name == "main",
+        ).all()
+    }
+
+    task_status = get_default_status(
+        for_concept=entity["entity_type_id"]
+        == concepts_service.get_concept_type()["id"]
+    )
+    current_user_id = None
+    try:
+        current_user_id = persons_service.get_current_user()["id"]
+    except RuntimeError:
+        pass
+
+    new_tasks = []
+    for task_type in task_types:
+        if str(task_type["id"]) in existing_type_ids:
+            continue
+        task = _build_task_no_commit(
+            task_type, task_status, entity, current_user_id
+        )
+        new_tasks.append((task_type, task))
+    Task.commit()
+
+    return [
+        _finalize_task_creation(task_type, task_status, task)
+        for task_type, task in new_tasks
+    ]
 
 
 def create_task(task_type, entity, name="main"):
@@ -1375,7 +1552,7 @@ def get_or_create_task_type(
     Create a new task type if it doesn't exist. If it exists, it returns the
     type from database.
     """
-    task_type = TaskType.get_by(name=name)
+    task_type = TaskType.get_by(name=name, for_entity=for_entity)
     if task_type is None:
         task_type = TaskType.create(
             name=name,
@@ -1623,29 +1800,40 @@ def check_revision_is_unique_for_task(
     existing = query.first()
     if existing is not None:
         raise RevisionAlreadyExistsException(
-            f"Revision {revision} already exists for this task."
+            f"Revision {revision} already exists for this task. "
+            "Choose a different revision number, or omit it to let the "
+            "revision auto-increment."
         )
 
 
-def add_preview_file_to_comment(comment_id, person_id, task_id, revision=0):
+def add_preview_file_to_comment(comment_id, person_id, task_id, revision=None):
     """
     Add a preview to comment preview list. Auto set the revision field
     (add 1 if it's a new preview, keep the preview revision in other cases).
+    A revision of None means "auto-pick the next revision"; an explicit 0
+    is a valid, stored revision.
     """
     comment = get_comment_raw(comment_id)
     news = News.get_by(comment_id=comment_id)
     task = Task.get(comment.object_id)
     project_id = str(task.project_id)
     position = 1
-    if revision == 0 and len(comment.previews) == 0:
+    if revision is None and len(comment.previews) == 0:
         revision = get_next_preview_revision(task_id)
-    elif revision == 0:
+    elif revision is None:
         revision = comment.previews[0].revision
         position = get_next_position(task_id, revision)
     else:
         if len(comment.previews) == 0:
             check_revision_is_unique_for_task(task_id, revision)
         position = get_next_position(task_id, revision)
+    if position > 1:
+        project = projects_service.get_project(project_id)
+        if project.get("is_single_preview_per_revision"):
+            raise TooManyPreviewFilesException(
+                "Only one preview file is allowed per revision for this "
+                "project."
+            )
     preview_file = files_service.create_preview_file_raw(
         str(uuid.uuid4())[:13], revision, task_id, person_id, position=position
     )

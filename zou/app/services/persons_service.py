@@ -78,18 +78,20 @@ def get_persons(minimal=False, include_guests=False):
 
 def get_all_raw_active_persons():
     """
-    Return all person stored in database without serialization.
+    Return all active persons without serialization. Guests are excluded.
     """
-    return Person.get_all_by(active=True)
+    return Person.query.filter(
+        Person.active, Person.is_guest.isnot(True)
+    ).all()
 
 
 @cache.memoize_function(120)
 def get_active_persons():
     """
-    Return all persons with flag active set to True.
+    Return all persons with flag active set to True. Guests are excluded.
     """
     persons = (
-        Person.query.filter_by(active=True)
+        Person.query.filter(Person.active, Person.is_guest.isnot(True))
         .order_by(Person.first_name)
         .order_by(Person.last_name)
         .all()
@@ -185,6 +187,37 @@ def get_persons_by_ids(person_ids):
         return []
     persons = Person.query.filter(Person.id.in_(person_ids)).all()
     return [person.serialize_safe() for person in persons]
+
+
+def build_short_person(person):
+    """
+    Return minimal author data to embed a comment or news author, including guests.
+    """
+    return {
+        "id": str(person.id),
+        "first_name": person.first_name,
+        "last_name": person.last_name,
+        "full_name": person.full_name,
+        "has_avatar": person.has_avatar,
+        "role": getattr(person.role, "code", person.role),
+    }
+
+
+def get_short_person(person_id):
+    """
+    Return the minimal author dict for the person matching given id.
+    """
+    return build_short_person(get_person_raw(person_id))
+
+
+def get_short_persons_map(person_ids):
+    """
+    Return a {id: minimal author dict} map for given ids in a single query.
+    """
+    if not person_ids:
+        return {}
+    persons = Person.query.filter(Person.id.in_(person_ids)).all()
+    return {str(person.id): build_short_person(person) for person in persons}
 
 
 def get_person_by_email_raw(email):
@@ -315,6 +348,7 @@ def create_person(
     is_bot=False,
     expiration_date=None,
     studio_id=None,
+    country=None,
     active=True,
     serialize=True,
 ):
@@ -357,6 +391,7 @@ def create_person(
         is_bot=is_bot,
         expiration_date=expiration_date,
         studio_id=studio_id,
+        country=country,
         active=active,
     )
     if is_bot:
@@ -566,14 +601,13 @@ def invite_person(person_id):
     organisation = get_organisation()
     token = auth_service.generate_reset_token()
     auth_tokens_store.add(
-        "reset-token-%s" % person["email"], token, ttl=3600 * 24 * 7
+        f"reset-token-{person['email']}", token, ttl=3600 * 24 * 7
     )
     params = {"email": person["email"], "token": token, "type": "new"}
     query = urllib.parse.urlencode(params)
-    reset_url = "%s://%s/reset-change-password?%s" % (
-        config.DOMAIN_PROTOCOL,
-        config.DOMAIN_NAME,
-        query,
+    reset_url = (
+        f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
+        f"/reset-change-password?{query}"
     )
 
     locale = person.get("locale") or getattr(config, "DEFAULT_LOCALE", "en_US")
@@ -722,10 +756,12 @@ def get_default_locale():
 def is_user_limit_reached():
     """
     Returns true if the number of active users is equal and superior to the
-    user limit set in the configuration.
+    user limit set in the configuration. Guests are excluded.
     """
     nb_active_users = Person.query.filter(
-        Person.active, Person.is_bot.isnot(True)
+        Person.active,
+        Person.is_bot.isnot(True),
+        Person.is_guest.isnot(True),
     ).count()
     return nb_active_users >= get_user_limit()
 

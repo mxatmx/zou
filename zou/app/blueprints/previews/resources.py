@@ -1,7 +1,7 @@
 import os
 import orjson as json
 
-from flask import abort, request, current_app
+from flask import request, current_app
 from flask import send_file as flask_send_file
 from flask_restful import Resource
 from flask_jwt_extended import jwt_required
@@ -12,6 +12,7 @@ from zou.app import config
 from zou.app.mixin import ArgsMixin
 from zou.app.utils import validation as validation_utils
 from zou.app.blueprints.previews.schemas import (
+    ExtractAnnotatedFrameSchema,
     PreviewFileUploadSchema,
     PreviewFilePositionSchema,
 )
@@ -43,9 +44,9 @@ from zou.app.services.exception import (
     PreviewBackgroundFileNotFoundException,
     PreviewFileNotFoundException,
     PreviewFileReuploadNotAllowedException,
+    PreviewProcessingFailedException,
     WrongParameterException,
 )
-
 
 ALLOWED_PICTURE_EXTENSION = {"jpe", "jpeg", "jpg", "png"}
 ALLOWED_MOVIE_EXTENSION = {
@@ -207,7 +208,7 @@ def send_storage_file(
         download_name = names_service.get_preview_file_name(preview_file_id)
 
     try:
-        return flask_send_file(
+        response = flask_send_file(
             file_path,
             conditional=True,
             mimetype=mimetype,
@@ -219,6 +220,13 @@ def send_storage_file(
     except IOError as e:
         current_app.logger.error(e)
         raise FileNotFound
+    # Preview bytes are gated by JWT / share-link token: never let a
+    # shared proxy store them. Flip Werkzeug's default `public,
+    # max-age=N` to `private, max-age=N` so the browser keeps caching
+    # but intermediaries don't.
+    response.cache_control.public = False
+    response.cache_control.private = True
+    return response
 
 
 class BaseNewPreviewFilePicture:
@@ -258,6 +266,14 @@ class BaseNewPreviewFilePicture:
         uploaded_movie_path = movie.save_file(
             tmp_folder, preview_file_id, uploaded_file
         )
+        if (
+            not os.path.exists(uploaded_movie_path)
+            or os.path.getsize(uploaded_movie_path) == 0
+        ):
+            raise WrongParameterException(
+                "Uploaded movie could not be written to temporary storage "
+                "or is empty; aborting before dispatching normalization."
+            )
         save_source_file = config.PREVIEW_SAVE_SOURCE_FILE
         if normalize and config.ENABLE_JOB_QUEUE and not no_job:
             queue_store.job_queue.enqueue(
@@ -345,17 +361,39 @@ class BaseNewPreviewFilePicture:
             )
             tasks_service.update_preview_file_info(preview_file)
         elif extension in ALLOWED_MOVIE_EXTENSION:
+            normalize = self.get_bool_parameter("normalize", "true")
             try:
-                normalize = self.get_bool_parameter("normalize", "true")
                 self.save_movie_preview(instance_id, uploaded_file, normalize)
-            except Exception as e:
-                current_app.logger.error(e, exc_info=1)
-                current_app.logger.error("Normalization failed.")
+            except WrongParameterException:
+                # Invalid upload (e.g. empty or corrupted transfer): the file
+                # itself is the problem, so keep the original 400 message.
                 deletion_service.remove_preview_file_by_id(
                     instance_id, force=True
                 )
                 if abort_on_failed:
-                    raise WrongParameterException("Normalization failed.")
+                    raise
+                return None
+            except Exception as e:
+                # Genuine server-side processing failure (ffmpeg, storage,
+                # normalization...): this is not the client's fault. Report it
+                # as a 500 and keep the underlying error so it can be
+                # diagnosed.
+                current_app.logger.error(e, exc_info=1)
+                if normalize:
+                    message = "Movie preview normalization failed."
+                else:
+                    message = (
+                        "Movie preview processing failed "
+                        "(normalization disabled)."
+                    )
+                current_app.logger.error(message)
+                deletion_service.remove_preview_file_by_id(
+                    instance_id, force=True
+                )
+                if abort_on_failed:
+                    raise PreviewProcessingFailedException(
+                        message, dict={"reason": str(e)}
+                    )
                 return None
             preview_file = preview_files_service.update_preview_file(
                 instance_id,
@@ -379,7 +417,7 @@ class BaseNewPreviewFilePicture:
             deletion_service.remove_preview_file_by_id(instance_id)
             if abort_on_failed:
                 raise WrongParameterException(
-                    "Wrong file format, extension: %s" % extension
+                    f"Wrong file format, extension: {extension}"
                 )
         else:
             self.emit_app_preview_event(instance_id)
@@ -437,7 +475,9 @@ class CreatePreviewFilePictureResource(
                       description: File size in bytes
                       example: 1024000
           400:
-            description: Wrong file format or normalization failed
+            description: Wrong file format or invalid upload
+          500:
+            description: Movie preview processing failed (server-side)
         """
         self.is_allowed(instance_id)
 
@@ -657,7 +697,9 @@ class BasePreviewFileResource(Resource):
         self.last_modified = None
 
     def is_allowed(self, preview_file_id):
-        self.preview_file = files_service.get_preview_file(preview_file_id)
+        self.preview_file = files_service.get_preview_file_for_access(
+            preview_file_id
+        )
         user_service.check_task_access(self.preview_file["task_id"])
         self.last_modified = date_helpers.get_datetime_from_string(
             self.preview_file["updated_at"]
@@ -704,7 +746,7 @@ class PreviewFileMovieResource(BasePreviewFileResource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Movie file was not found for: %s" % instance_id
+                    f"Movie file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -755,7 +797,7 @@ class PreviewFileLowMovieResource(BasePreviewFileResource):
             except FileNotFound:
                 if config.LOG_FILE_NOT_FOUND:
                     current_app.logger.error(
-                        "Movie file was not found for: %s" % instance_id
+                        f"Movie file was not found for: {instance_id}"
                     )
                 raise PreviewFileNotFoundException
 
@@ -802,7 +844,7 @@ class PreviewFileMovieDownloadResource(BasePreviewFileResource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Movie file was not found for: %s" % instance_id
+                    f"Movie file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -854,7 +896,7 @@ class PreviewFileResource(BasePreviewFileResource):
                 not in ALLOWED_PICTURE_EXTENSION | ALLOWED_FILE_EXTENSION
             ):
                 raise WrongParameterException(
-                    "Extension not allowed: %s" % extension
+                    f"Extension not allowed: {extension}"
                 )
             if extension == "png":
                 return send_picture_file(
@@ -876,7 +918,7 @@ class PreviewFileResource(BasePreviewFileResource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Non-movie file was not found for: %s" % instance_id
+                    f"Non-movie file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -949,7 +991,7 @@ class PreviewFileDownloadResource(BasePreviewFileResource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Standard file was not found for: %s" % instance_id
+                    f"Standard file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -1020,8 +1062,7 @@ class AttachmentThumbnailResource(Resource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Picture file was not found for attachment: %s"
-                    % (attachment_file_id)
+                    f"Picture file was not found for attachment: {attachment_file_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -1072,7 +1113,7 @@ class BasePreviewPictureResource(BasePreviewFileResource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Picture file was not found for: %s" % instance_id
+                    f"Picture file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
 
@@ -1083,7 +1124,9 @@ class BasePreviewFileThumbnailResource(BasePreviewPictureResource):
     """
 
     def is_allowed(self, preview_file_id):
-        self.preview_file = files_service.get_preview_file(preview_file_id)
+        self.preview_file = files_service.get_preview_file_for_access(
+            preview_file_id
+        )
         task = tasks_service.get_task(self.preview_file["task_id"])
         entity = entities_service.get_entity(task["entity_id"])
         if (
@@ -1164,8 +1207,8 @@ class BaseThumbnailResource(Resource):
     def emit_event(self, instance_id):
         model_name = self.data_type[:-1]
         events.emit(
-            "%s:set-thumbnail" % model_name,
-            {"%s_id" % model_name: instance_id},
+            f"{model_name}:set-thumbnail",
+            {f"{model_name}_id": instance_id},
         )
 
     @jwt_required()
@@ -1271,7 +1314,7 @@ class BaseThumbnailResource(Resource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Thumbnail file was not found for: %s" % instance_id
+                    f"Thumbnail file was not found for: {instance_id}"
                 )
             raise PreviewFileNotFoundException
         except IOError as e:
@@ -1702,6 +1745,8 @@ class ExtractFrameFromPreview(Resource, ArgsMixin):
                 preview_file, args["frame_number"]
             )
         )
+        if extracted_frame_path is None:
+            return {"error": "preview file binary is not available"}, 404
         try:
             return flask_send_file(
                 extracted_frame_path,
@@ -1712,6 +1757,205 @@ class ExtractFrameFromPreview(Resource, ArgsMixin):
             )
         finally:
             os.remove(extracted_frame_path)
+
+
+class ExtractAnnotatedFrameFromPreview(Resource):
+    """
+    Extract a frame (movie) or the picture itself, with its matching
+    annotation rendered on top.
+    """
+
+    @jwt_required()
+    def get(self, preview_file_id):
+        """
+        Extract annotated frame from preview
+        ---
+        description: Extract a frame from a movie preview, or the picture
+          itself from a picture preview, and overlay the matching
+          annotation on it. `frame_number` is required for movies and
+          ignored for pictures. Returns 400 if no annotation is recorded.
+        tags:
+          - Previews
+        parameters:
+          - in: path
+            name: preview_file_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Preview file unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: frame_number
+            required: false
+            schema:
+              type: integer
+              minimum: 1
+            description: Frame number to extract (movies only, 1-based)
+            example: 120
+        responses:
+          200:
+            description: Composited frame as PNG image
+            content:
+              image/png:
+                schema:
+                  type: string
+                  format: binary
+          400:
+            description: No annotation, missing frame_number on movie, or
+              unsupported extension
+          404:
+            description: Preview file binary is not available
+        """
+        args = validation_utils.validate_request_body(
+            ExtractAnnotatedFrameSchema
+        )
+        preview_file = files_service.get_preview_file(preview_file_id)
+        task = tasks_service.get_task(preview_file["task_id"])
+        user_service.check_manager_project_access(task["project_id"])
+        extracted_frame_path = (
+            preview_files_service.extract_annotation_frame_from_preview_file(
+                preview_file, args.frame_number
+            )
+        )
+        if extracted_frame_path is None:
+            return {"error": "preview file binary is not available"}, 404
+        try:
+            return flask_send_file(
+                extracted_frame_path,
+                conditional=True,
+                mimetype="image/png",
+                as_attachment=False,
+                download_name=os.path.basename(extracted_frame_path),
+            )
+        finally:
+            os.remove(extracted_frame_path)
+
+
+def _serve_annotated_frames_bundle(
+    preview_file_id, build_bundle, mimetype, file_extension
+):
+    """
+    Common flow for the zip and pdf bulk-download resources: check
+    permissions, build the bundle via the service, send it as an
+    attachment named `{preview_base_name}_annotated_frames.{ext}`.
+    """
+    preview_file = files_service.get_preview_file(preview_file_id)
+    task = tasks_service.get_task(preview_file["task_id"])
+    user_service.check_manager_project_access(task["project_id"])
+    bundle_path = build_bundle(preview_file)
+    if bundle_path is None:
+        return {"error": "preview file binary is not available"}, 404
+    base_name = os.path.splitext(
+        names_service.get_preview_file_name(preview_file_id)
+    )[0]
+    download_name = f"{base_name}_annotated_frames.{file_extension}"
+    try:
+        return flask_send_file(
+            bundle_path,
+            conditional=True,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=download_name,
+        )
+    finally:
+        os.remove(bundle_path)
+
+
+class ExtractAllAnnotatedFramesFromPreview(Resource):
+    """
+    Build a zip archive containing every annotated frame (movie) or
+    every annotated copy of the picture preview.
+    """
+
+    @jwt_required()
+    def get(self, preview_file_id):
+        """
+        Extract all annotated frames from preview as a zip
+        ---
+        description: Build a zip archive with one PNG per annotation —
+          for movies, the extracted frame at the annotation's time; for
+          pictures, a copy of the picture with the annotation rendered.
+          Returns 400 if the preview has no annotations.
+        tags:
+          - Previews
+        parameters:
+          - in: path
+            name: preview_file_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Preview file unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+          200:
+            description: Zip archive of annotated frames
+            content:
+              application/zip:
+                schema:
+                  type: string
+                  format: binary
+          400:
+            description: Preview has no annotations or unsupported
+              extension
+          404:
+            description: Preview file binary is not available
+        """
+        return _serve_annotated_frames_bundle(
+            preview_file_id,
+            preview_files_service.extract_all_annotation_frames_from_preview_file,
+            mimetype="application/zip",
+            file_extension="zip",
+        )
+
+
+class ExtractAllAnnotatedFramesAsPdfFromPreview(Resource):
+    """
+    Build a multi-page PDF containing every annotated frame (movie) or
+    every annotated copy of the picture preview.
+    """
+
+    @jwt_required()
+    def get(self, preview_file_id):
+        """
+        Extract all annotated frames from preview as a PDF
+        ---
+        description: Build a multi-page PDF with one page per annotation
+          — for movies, the extracted frame at the annotation's time; for
+          pictures, a copy of the picture with the annotation rendered.
+          Returns 400 if the preview has no annotations.
+        tags:
+          - Previews
+        parameters:
+          - in: path
+            name: preview_file_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Preview file unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+          200:
+            description: PDF document with annotated frames as pages
+            content:
+              application/pdf:
+                schema:
+                  type: string
+                  format: binary
+          400:
+            description: Preview has no annotations or unsupported
+              extension
+          404:
+            description: Preview file binary is not available
+        """
+        return _serve_annotated_frames_bundle(
+            preview_file_id,
+            preview_files_service.extract_all_annotation_frames_pdf_from_preview_file,
+            mimetype="application/pdf",
+            file_extension="pdf",
+        )
 
 
 class ExtractTileFromPreview(Resource):
@@ -1750,6 +1994,8 @@ class ExtractTileFromPreview(Resource):
         extracted_tile_path = (
             preview_files_service.extract_tile_from_preview_file(preview_file)
         )
+        if extracted_tile_path is None:
+            return {"error": "preview file binary is not available"}, 404
         file_store.add_picture("tiles", preview_file_id, extracted_tile_path)
         try:
             return flask_send_file(
@@ -1996,8 +2242,7 @@ class PreviewBackgroundFileResource(Resource):
         except FileNotFound:
             if config.LOG_FILE_NOT_FOUND:
                 current_app.logger.error(
-                    "Preview background file was not found for: %s"
-                    % instance_id
+                    f"Preview background file was not found for: {instance_id}"
                 )
             raise PreviewBackgroundFileNotFoundException
 

@@ -59,7 +59,9 @@ def _remove_user_from_room_index(user_id, room_id):
 
 
 def _validate_comparing(data):
-    """Sanitize the comparing dict to only keep known fields."""
+    """
+    Sanitize the comparing dict to only keep known fields.
+    """
     if not isinstance(data, dict):
         return None
     return {k: v for k, v in data.items() if k in COMPARING_FIELDS}
@@ -155,7 +157,7 @@ def _update_room_playing_status(data, room):
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"name": "%s Event stream" % config.APP_NAME})
+    return jsonify({"name": f"{config.APP_NAME} Event stream"})
 
 
 @app.route("/stats", methods=["GET"])
@@ -203,7 +205,7 @@ def on_error(error):
 @app.route("/rooms", methods=["GET", "POST"])
 @jwt_required()
 def rooms():
-    return jsonify({"name": "%s Review rooms" % config.APP_NAME})
+    return jsonify({"name": f"{config.APP_NAME} Review rooms"})
 
 
 @socketio.on("preview-room:open-playlist", namespace="/events")

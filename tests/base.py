@@ -98,7 +98,7 @@ class ApiTestCase(unittest.TestCase):
             "auth/login", {"email": email, "password": "mypassword"}, 200
         )
         self.auth_headers = {
-            "Authorization": "Bearer %s" % tokens["access_token"]
+            "Authorization": f"Bearer {tokens['access_token']}"
         }
         self.base_headers.update(self.auth_headers)
         self.post_headers.update(self.auth_headers)
@@ -684,6 +684,7 @@ class ApiDBTestCase(ApiTestCase):
         last_name="Doe",
         desktop_login="john.doe",
         email="john.doe@gmail.com",
+        country=None,
     ):
         self.person = Person.get_by(email=email)
         if self.person is None:
@@ -693,6 +694,7 @@ class ApiDBTestCase(ApiTestCase):
                 desktop_login=desktop_login,
                 email=email,
                 password=_CACHED_PASSWORD_HASH,
+                country=country,
             )
         return self.person
 
@@ -1471,7 +1473,7 @@ class ApiDBTestCase(ApiTestCase):
 
     def upload_csv(self, path, name):
         file_path_fixture = self.get_fixture_file_path(
-            os.path.join("csv", "%s.csv" % name)
+            os.path.join("csv", f"{name}.csv")
         )
         self.upload_file(path, file_path_fixture)
 

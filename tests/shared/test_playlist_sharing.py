@@ -1,5 +1,7 @@
 from tests.base import ApiDBTestCase
 
+from zou.app.utils import events
+
 
 class PlaylistSharingTestCase(ApiDBTestCase):
     def setUp(self):
@@ -57,9 +59,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(len(result), 1)
 
     def test_share_link_routes_check_project_access(self):
-        """A manager who is not on the playlist's project must not be
+        """
+        A manager who is not on the playlist's project must not be
         able to list, create, or revoke share links for that playlist
-        (cross-project IDOR)."""
+        (cross-project IDOR).
+        """
         link = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
             {"can_comment": True},
@@ -82,9 +86,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_revoke_share_link_rejects_mismatched_playlist(self):
-        """A token must only be revocable through the URL of the playlist
+        """
+        A token must only be revocable through the URL of the playlist
         it actually belongs to. Otherwise an admin/manager who knows any
-        token could revoke it via any playlist URL they have access to."""
+        token could revoke it via any playlist URL they have access to.
+        """
         from zou.app.models.playlist import Playlist
 
         other_playlist = Playlist.create(
@@ -105,9 +111,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_share_link_password_is_hashed_and_not_serialized(self):
-        """Manager-facing endpoints must never return the share link
+        """
+        Manager-facing endpoints must never return the share link
         password, and the value stored at rest must be a bcrypt hash, not
-        plaintext."""
+        plaintext.
+        """
         from zou.app.models.playlist_share_link import PlaylistShareLink
 
         plaintext = "topsecret123"
@@ -130,8 +138,10 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertTrue(stored.password.startswith("$2"))
 
     def test_share_link_password_validates_with_bcrypt(self):
-        """The shared playlist endpoint must accept the correct password
-        (verified against the bcrypt hash) and reject incorrect ones."""
+        """
+        The shared playlist endpoint must accept the correct password
+        (verified against the bcrypt hash) and reject incorrect ones.
+        """
         plaintext = "topsecret123"
         result = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
@@ -215,6 +225,40 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(guest["first_name"], "John")
         self.assertTrue(guest["is_guest"])
 
+    def test_create_guest_emits_person_new(self):
+        """
+        Connected clients (e.g. a reviewing manager) rely on the
+        ``person:new`` event to learn about a freshly minted guest, so
+        their personMap can resolve the person_id carried by the guest's
+        first comment. Without this the comment renders blank.
+        """
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        events.unregister_all()
+        received = []
+
+        class _Sink:
+            __name__ = "guest_person_new_sink"
+
+            def handle_event(self_sink, data):
+                received.append(data)
+
+        events.register("person:new", "guest_person_new_sink", _Sink())
+        try:
+            guest = self.post(
+                f"/shared/playlists/{link['token']}/guest",
+                {"first_name": "Lena"},
+                201,
+            )
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0]["person_id"], guest["id"])
+        finally:
+            events.unregister("person:new", "guest_person_new_sink")
+
     def test_reuse_guest(self):
         link = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
@@ -235,9 +279,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(guest["id"], guest2["id"])
 
     def test_create_guest_same_name_different_link(self):
-        """A guest created via link A must not be reused via link B even
+        """
+        A guest created via link A must not be reused via link B even
         if both submit the same name. Otherwise an attacker holding link B
-        could impersonate any reviewer who used the same name on link A."""
+        could impersonate any reviewer who used the same name on link A.
+        """
         link_a = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
             {},
@@ -262,8 +308,10 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertNotEqual(guest_a["id"], guest_b["id"])
 
     def test_reuse_guest_id_other_link_rejected(self):
-        """A guest_id leaked from link A must not be reusable on link B —
-        the server must ignore it and create a fresh guest instead."""
+        """
+        A guest_id leaked from link A must not be reusable on link B —
+        the server must ignore it and create a fresh guest instead.
+        """
         link_a = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
             {},
@@ -314,8 +362,10 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(comment["text"], "Great work!")
 
     def test_guest_comment_rejects_foreign_guest(self):
-        """A guest_id from share link A cannot be replayed to post a
-        comment via share link B."""
+        """
+        A guest_id from share link A cannot be replayed to post a
+        comment via share link B.
+        """
         link_a = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
             {"can_comment": True},
@@ -344,10 +394,12 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_guest_comment_ui_built_playlist(self):
-        """Shots added via the playlist builder are stored as
+        """
+        Shots added via the playlist builder are stored as
         ``{entity_id, preview_file_id}`` only — no ``preview_file_task_id``.
         The guest comment guard must still accept comments on the
-        previewed task by deriving it from the preview file."""
+        previewed task by deriving it from the preview file.
+        """
         from zou.app.models.playlist import Playlist as PlaylistModel
         from zou.app.models.preview_file import PreviewFile
 
@@ -392,8 +444,10 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_guest_comment_rejects_foreign_task(self):
-        """A guest cannot post a comment on a task that is not part of the
-        playlist they hold a share link to."""
+        """
+        A guest cannot post a comment on a task that is not part of the
+        playlist they hold a share link to.
+        """
         from zou.app.models.task import Task
 
         foreign_task = Task.create(
@@ -426,7 +480,9 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_guest_comment_rejects_non_client_status(self):
-        """A guest cannot set a task status that is not client-allowed."""
+        """
+        A guest cannot set a task status that is not client-allowed.
+        """
         from zou.app.models.task_status import TaskStatus
 
         manager_status = TaskStatus.create(
@@ -483,8 +539,10 @@ class PlaylistSharingTestCase(ApiDBTestCase):
     # --- Share invitations ---
 
     def test_invite_share_link(self):
-        """Manager can invite recipients by raw email and by person id;
-        the response lists the dispatched, deduplicated emails."""
+        """
+        Manager can invite recipients by raw email and by person id;
+        the response lists the dispatched, deduplicated emails.
+        """
         from unittest.mock import patch
         from zou.app.models.person import Person
 
@@ -523,7 +581,9 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         )
 
     def test_invite_share_link_rejects_mismatched_playlist(self):
-        """A token belonging to playlist A cannot be invited via playlist B."""
+        """
+        A token belonging to playlist A cannot be invited via playlist B.
+        """
         from unittest.mock import patch
 
         # generate_fixture_playlist mutates self.playlist as a side effect,
@@ -547,7 +607,9 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(send_mock.call_count, 0)
 
     def test_invite_share_link_rejects_invalid_email(self):
-        """A malformed email aborts the whole batch with a 400."""
+        """
+        A malformed email aborts the whole batch with a 400.
+        """
         from unittest.mock import patch
 
         link = self.post(
@@ -569,9 +631,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
     # --- Shared preview file downloads ---
 
     def _attach_zip_preview_to_playlist(self):
-        """Create a non-mp4 preview file with real bytes on disk and wire
+        """
+        Create a non-mp4 preview file with real bytes on disk and wire
         it into the playlist's shots so that the shared preview-file
-        guard recognises it."""
+        guard recognises it.
+        """
         import tempfile
 
         from zou.app.models.playlist import Playlist as PlaylistModel
@@ -608,11 +672,13 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         return preview_file, payload
 
     def test_shared_preview_file_download(self):
-        """Any non-mp4 preview file in a shared playlist must be
+        """
+        Any non-mp4 preview file in a shared playlist must be
         downloadable through the share link. Before this endpoint
         existed, Kitsu built the download URL on the movies/originals
         streaming path with the file's actual extension, which only
-        matched ``.mp4`` and 404'd for every other extension."""
+        matched ``.mp4`` and 404'd for every other extension.
+        """
         preview_file, payload = self._attach_zip_preview_to_playlist()
         link = self.post(
             f"/data/playlists/{self.playlist['id']}/share",
@@ -637,9 +703,11 @@ class PlaylistSharingTestCase(ApiDBTestCase):
         self.assertEqual(response.status_code, 404)
 
     def test_shared_preview_file_download_not_in_playlist(self):
-        """A preview file that is not exposed by the shared playlist
+        """
+        A preview file that is not exposed by the shared playlist
         cannot be fetched through its share link, even when the token
-        is valid."""
+        is valid.
+        """
         from zou.app.models.preview_file import PreviewFile
 
         foreign = PreviewFile.create(
@@ -660,3 +728,268 @@ class PlaylistSharingTestCase(ApiDBTestCase):
             f"/preview-files/{foreign.id}/download"
         )
         self.assertEqual(response.status_code, 403)
+
+    def test_shared_preview_file_download_sibling_position(self):
+        """
+        A revision can carry multiple PreviewFile rows (different
+        positions). The shared share link exposes all positions of the
+        positioned revision, not only the one stored on the shot.
+        """
+        import tempfile
+
+        from zou.app.models.playlist import Playlist as PlaylistModel
+        from zou.app.models.preview_file import PreviewFile
+        from zou.app.stores import file_store
+
+        positioned, payload = self._attach_zip_preview_to_playlist()
+        sibling = PreviewFile.create(
+            name="sibling.zip",
+            revision=positioned.revision,
+            position=positioned.position + 1,
+            extension="zip",
+            task_id=positioned.task_id,
+            person_id=self.person.id,
+        )
+        sibling_payload = b"PK\x03\x04sibling-position"
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(sibling_payload)
+            tmp_path = tmp.name
+        file_store.add_file("previews", str(sibling.id), tmp_path)
+        self.addCleanup(file_store.remove_file, "previews", str(sibling.id))
+
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/preview-files/{sibling.id}/download"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, sibling_payload)
+
+    def test_shared_preview_file_download_other_revision_rejected(self):
+        """
+        A different revision of the same task is *not* exposed,
+        only the positioned revision and its sibling positions.
+        """
+        from zou.app.models.preview_file import PreviewFile
+
+        positioned, _ = self._attach_zip_preview_to_playlist()
+        other_revision = PreviewFile.create(
+            name="other.zip",
+            revision=positioned.revision + 1,
+            extension="zip",
+            task_id=positioned.task_id,
+            person_id=self.person.id,
+        )
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/preview-files/{other_revision.id}/download"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    # --- Shared original picture by extension (gif, svg, jpg, ...) ---
+
+    def _attach_gif_preview_to_playlist(self):
+        """
+        Create an animated-GIF still preview with real bytes on disk and
+        wire it into the playlist's shots, the way an uploaded GIF is
+        stored (under the ``previews`` prefix, extension ``gif``).
+        """
+        import tempfile
+
+        from zou.app.models.playlist import Playlist as PlaylistModel
+        from zou.app.models.preview_file import PreviewFile
+        from zou.app.stores import file_store
+
+        preview_file = PreviewFile.create(
+            name="loop.gif",
+            revision=1,
+            extension="gif",
+            task_id=self.task.id,
+            person_id=self.person.id,
+        )
+        payload = b"GIF89a-fake-animated-payload"
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+            tmp.write(payload)
+            tmp_path = tmp.name
+        file_store.add_file("previews", str(preview_file.id), tmp_path)
+        self.addCleanup(
+            file_store.remove_file, "previews", str(preview_file.id)
+        )
+
+        PlaylistModel.get(self.playlist["id"]).update(
+            {
+                "shots": [
+                    {
+                        "id": str(self.asset.id),
+                        "preview_file_id": str(preview_file.id),
+                        "preview_file_task_id": str(self.task.id),
+                    }
+                ]
+            }
+        )
+        return preview_file, payload
+
+    def test_shared_original_gif(self):
+        """
+        A GIF still preview in a shared playlist must be served through
+        the originals picture path. The ``.png``-only shared route did
+        not match ``.gif`` (or any non-PNG extension), so animated GIFs
+        404'd through a share link.
+        """
+        preview_file, payload = self._attach_gif_preview_to_playlist()
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/pictures/originals/preview-files/{preview_file.id}.gif"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, payload)
+
+    def test_shared_original_gif_not_in_playlist(self):
+        """
+        A GIF preview that the shared playlist does not expose cannot be
+        fetched through its share link, even with a valid token.
+        """
+        from zou.app.models.preview_file import PreviewFile
+
+        foreign = PreviewFile.create(
+            name="foreign.gif",
+            revision=1,
+            extension="gif",
+            task_id=self.task.id,
+            person_id=self.person.id,
+        )
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/pictures/originals/preview-files/{foreign.id}.gif"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_shared_original_extension_not_allowed(self):
+        """
+        Disallowed extensions are rejected with a 400, mirroring the
+        authenticated generic originals route.
+        """
+        preview_file, _ = self._attach_gif_preview_to_playlist()
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/pictures/originals/preview-files/{preview_file.id}.exe"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_shared_original_png_still_served(self):
+        """
+        Regression guard: the static ``.png`` originals route must keep
+        winning over the new generic ``.<extension>`` route, and a PNG
+        original (stored under the ``original`` picture prefix) is served.
+        """
+        import tempfile
+
+        from zou.app.models.playlist import Playlist as PlaylistModel
+        from zou.app.models.preview_file import PreviewFile
+        from zou.app.stores import file_store
+
+        preview_file = PreviewFile.create(
+            name="still.png",
+            revision=1,
+            extension="png",
+            task_id=self.task.id,
+            person_id=self.person.id,
+        )
+        payload = b"\x89PNG\r\n\x1a\n-fake-original-png"
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(payload)
+            tmp_path = tmp.name
+        file_store.add_picture("original", str(preview_file.id), tmp_path)
+        self.addCleanup(
+            file_store.remove_picture, "original", str(preview_file.id)
+        )
+        PlaylistModel.get(self.playlist["id"]).update(
+            {
+                "shots": [
+                    {
+                        "id": str(self.asset.id),
+                        "preview_file_id": str(preview_file.id),
+                        "preview_file_task_id": str(self.task.id),
+                    }
+                ]
+            }
+        )
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/pictures/originals/preview-files/{preview_file.id}.png"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, payload)
+
+    def test_shared_original_missing_file(self):
+        """
+        A preview that is part of the shared playlist but whose original
+        file is absent from storage yields a 404, not a 500.
+        """
+        from zou.app.models.playlist import Playlist as PlaylistModel
+        from zou.app.models.preview_file import PreviewFile
+
+        preview_file = PreviewFile.create(
+            name="gone.gif",
+            revision=1,
+            extension="gif",
+            task_id=self.task.id,
+            person_id=self.person.id,
+        )
+        PlaylistModel.get(self.playlist["id"]).update(
+            {
+                "shots": [
+                    {
+                        "id": str(self.asset.id),
+                        "preview_file_id": str(preview_file.id),
+                        "preview_file_task_id": str(self.task.id),
+                    }
+                ]
+            }
+        )
+        link = self.post(
+            f"/data/playlists/{self.playlist['id']}/share",
+            {},
+            201,
+        )
+        self.log_out()
+        response = self.app.get(
+            f"/shared/playlists/{link['token']}"
+            f"/pictures/originals/preview-files/{preview_file.id}.gif"
+        )
+        self.assertEqual(response.status_code, 404)

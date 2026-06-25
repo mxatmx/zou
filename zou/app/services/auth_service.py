@@ -1,7 +1,6 @@
 import pyotp
 import random
 import string
-import flask_bcrypt
 
 from datetime import timedelta
 
@@ -36,7 +35,7 @@ from zou.app.services.exception import (
 )
 from zou.app import config
 from zou.app.stores import auth_tokens_store
-from zou.app.utils import date_helpers, emails
+from zou.app.utils import auth, date_helpers, emails
 from zou.app.utils.email_i18n import get_email_translation
 
 from fido2.webauthn import (
@@ -148,9 +147,7 @@ def local_auth_strategy(person, password, app=None):
     """
     try:
         password_hash = person["password"] or ""
-        if password_hash and flask_bcrypt.check_password_hash(
-            password_hash, password
-        ):
+        if password_hash and auth.check_password(password_hash, password):
             return person
         else:
             raise WrongPasswordException()
@@ -197,14 +194,13 @@ def ldap_auth_strategy(person, password, app):
 
         except LDAPSocketOpenError:
             app.logger.error(
-                "Cannot connect to LDAP/Active directory server %s "
-                % (ldap_server)
+                f"Cannot connect to LDAP/Active directory server {ldap_server} "
             )
             raise LDAPSocketOpenError()
 
         except LDAPInvalidCredentialsResult:
             app.logger.error(
-                "LDAP cannot authenticate user: %s" % person["email"]
+                f"LDAP cannot authenticate user: {person['email']}"
             )
             raise WrongPasswordException()
 
@@ -310,12 +306,12 @@ def check_email_otp(person, email_otp):
     """
     Check email OTP for a person.
     """
-    count = auth_tokens_store.get("email-otp-count-%s" % person["email"])
+    count = auth_tokens_store.get(f"email-otp-count-{person['email']}")
     if count is not None:
         if pyotp.HOTP(person["email_otp_secret"]).verify(
             email_otp, int(count)
         ):
-            auth_tokens_store.delete("email-otp-count-%s" % person["email"])
+            auth_tokens_store.delete(f"email-otp-count-{person['email']}")
             return True
     return False
 
@@ -325,7 +321,7 @@ def check_recovery_code(person, recovery_code):
     Check recovery code for a person.
     """
     for recovery_hash in person["otp_recovery_codes"]:
-        if flask_bcrypt.check_password_hash(recovery_hash, recovery_code):
+        if auth.check_password(recovery_hash, recovery_code):
             remove_otp_revovery_code(person["id"], recovery_hash)
             return True
     return False
@@ -336,7 +332,7 @@ def check_fido(person, authentication_response):
     Check fido for a person.
     """
     try:
-        state = session.pop("fido-state-%s" % person["id"])
+        state = session.pop(f"fido-state-{person['id']}")
     except KeyError:
         return False
     try:
@@ -364,7 +360,7 @@ def pre_enable_totp(person_id):
         totp = pyotp.TOTP(person.totp_secret)
         organisation = persons_service.get_organisation()
         totp_provisionning_uri = totp.provisioning_uri(
-            name=person.email, issuer_name="Kitsu %s" % organisation["name"]
+            name=person.email, issuer_name=f"Kitsu {organisation['name']}"
         )
         person.totp_enabled = False
         person.commit()
@@ -484,7 +480,7 @@ def send_email_otp(person):
     count = random.randint(0, 999999999999)
     otp = pyotp.HOTP(person["email_otp_secret"]).at(count)
     auth_tokens_store.add(
-        "email-otp-count-%s" % person["email"], count, ttl=60 * 5
+        f"email-otp-count-{person['email']}", count, ttl=60 * 5
     )
     organisation = persons_service.get_organisation()
     locale = person.get("locale") or getattr(config, "DEFAULT_LOCALE", "en_US")
@@ -558,7 +554,7 @@ def pre_register_fido(person_id):
         user_verification="preferred",
         authenticator_attachment="cross-platform",
     )
-    session["fido-state-%s" % person.id] = state
+    session[f"fido-state-{person.id}"] = state
     return dict(options.public_key)
 
 
@@ -568,7 +564,7 @@ def register_fido(person_id, registration_response, device_name):
     """
     person = Person.get(person_id)
     try:
-        state = session.pop("fido-state-%s" % person.id)
+        state = session.pop(f"fido-state-{person.id}")
     except KeyError:
         raise FIDONoPreregistrationException()
     try:
@@ -640,7 +636,7 @@ def get_challenge_fido(person_id):
             person.fido_credentials
         ),
     )
-    session["fido-state-%s" % person.id] = state
+    session[f"fido-state-{person.id}"] = state
     return dict(options.public_key)
 
 
@@ -721,7 +717,7 @@ def hash_recovery_codes(recovery_codes):
     Hash recovery codes given as argument and return them.
     """
     return [
-        flask_bcrypt.generate_password_hash(recovery_code)
+        auth.encrypt_password(recovery_code)
         for recovery_code in recovery_codes
     ]
 
