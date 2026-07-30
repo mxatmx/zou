@@ -6,8 +6,6 @@ from PIL import Image
 import math
 
 from pathlib import Path
-from urllib import request
-
 import ffmpeg
 
 from zou.utils import movie
@@ -15,13 +13,13 @@ from zou.utils import movie
 
 class MovieTestCase(unittest.TestCase):
     def setUp(self):
-        # download test file once
         self.tmpdir = tempfile.mkdtemp()
         self.video_only_path = str(Path(self.tmpdir) / "demo.m4v")
-        test_url = os.getenv(
-            "ZOU_TEST_VIDEO_URL", "http://fate-suite.ffmpeg.org/mpeg4/demo.m4v"
-        )
-        request.urlretrieve(test_url, self.video_only_path)
+        # Generate the video fixture locally. Downloading it from the public
+        # FFmpeg fate suite made the tests depend on external network access.
+        ffmpeg.input("color=c=black:s=320x240:d=1", f="lavfi").output(
+            self.video_only_path, r=5, vcodec="libx264", pix_fmt="yuv420p"
+        ).overwrite_output().run(quiet=True)
 
     def tearDown(self):
         super(MovieTestCase, self).tearDown()
