@@ -1930,7 +1930,7 @@ class ClearAvatarPersonResource(MethodView):
         return "", 204
 
 
-class AllPersonSoftwareResource(Resource, ArgsMixin):
+class AllPersonSoftwareResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -1977,7 +1977,7 @@ class AllPersonSoftwareResource(Resource, ArgsMixin):
         return softwares, 200
 
 
-class AddSoftwareToPersonResource(Resource, ArgsMixin):
+class AddSoftwareToPersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2091,7 +2091,7 @@ class AddSoftwareToPersonResource(Resource, ArgsMixin):
         return software, 201
 
 
-class SoftwarePersonResource(Resource, ArgsMixin):
+class SoftwarePersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2128,7 +2128,7 @@ class SoftwarePersonResource(Resource, ArgsMixin):
         return "", 204
 
 
-class AllPersonHardwareItemsResource(Resource, ArgsMixin):
+class AllPersonHardwareItemsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2171,7 +2171,7 @@ class AllPersonHardwareItemsResource(Resource, ArgsMixin):
         return hardware_items, 200
 
 
-class AddHardwareItemToPersonResource(Resource, ArgsMixin):
+class AddHardwareItemToPersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2285,7 +2285,7 @@ class AddHardwareItemToPersonResource(Resource, ArgsMixin):
         return hardware_item_link, 201
 
 
-class HardwareItemPersonResource(Resource, ArgsMixin):
+class HardwareItemPersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2322,4 +2322,3 @@ class HardwareItemPersonResource(Resource, ArgsMixin):
             person_id, hardware_item_id
         )
         return "", 204
-
