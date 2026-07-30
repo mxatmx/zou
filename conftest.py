@@ -16,6 +16,9 @@ _REAL_BCRYPT_FILES = {
     # Share-link passwords are hashed with bcrypt; the verification
     # path must not be patched to always-True for this file.
     "test_playlist_sharing.py",
+    # Recovery codes are hashed with bcrypt and their verification is
+    # exactly what the FIDO unregister tests assert.
+    "test_fido.py",
 }
 
 # flask_bcrypt module-level functions create a Bcrypt() instance without
@@ -46,10 +49,15 @@ def _skip_bcrypt_check(request, monkeypatch):
 
 def pytest_configure(config):
     """
-    Create database schema once for the entire test session.
+    Build the application explicitly and create the database schema once
+    for the entire test session. Importing zou.app no longer builds the
+    app as a side effect: the suite owns the moment (and the config
+    environment) the app is wired with.
     """
-    from zou.app import app
+    from zou.app import create_app
     from zou.app.utils import dbhelpers
+
+    app = create_app()
 
     # Register the admin blueprint so it can be tested.
     from zou.app.blueprints.admin import blueprint as admin_blueprint

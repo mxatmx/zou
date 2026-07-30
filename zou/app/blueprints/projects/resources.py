@@ -1,5 +1,4 @@
-from flask import abort
-from flask_restful import Resource
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 
@@ -16,14 +15,18 @@ from zou.app.services import (
 from zou.app.utils import permissions, validation
 from zou.app.blueprints.projects.schemas import (
     ProjectTeamSchema,
+    ProjectTeamRoleSchema,
     ProjectAssetTypeSchema,
     ProjectTaskTypeSchema,
     ProjectTaskStatusSchema,
+    ProjectSettingsBatchSchema,
     ProjectStatusAutomationSchema,
     ProjectPreviewBackgroundSchema,
     MetadataDescriptorSchema,
     MetadataDescriptorUpdateSchema,
     MetadataDescriptorOrderSchema,
+    AllProjectsMetadataDescriptorUpdateSchema,
+    AllProjectsMetadataDescriptorOrderSchema,
     BudgetSchema,
     BudgetUpdateSchema,
     BudgetEntrySchema,
@@ -32,13 +35,14 @@ from zou.app.blueprints.projects.schemas import (
 )
 from zou.app.services.exception import (
     BudgetNotFoundException,
+    TaskTypeNotFoundException,
     WrongDateFormatException,
     WrongParameterException,
 )
 from zou.app.models.metadata_descriptor import METADATA_DESCRIPTOR_TYPES
 
 
-class OpenProjectsResource(Resource, ArgsMixin):
+class OpenProjectsResource(MethodView, ArgsMixin):
     """
     Return the list of projects currently running. Most of the time, past
     projects are not needed.
@@ -93,7 +97,7 @@ class OpenProjectsResource(Resource, ArgsMixin):
             return user_service.get_open_projects(name)
 
 
-class AllProjectsResource(Resource, ArgsMixin):
+class AllProjectsResource(MethodView, ArgsMixin):
     """
     Return all projects listed in database. Ensure that user has at least
     the manager level before that.
@@ -156,7 +160,7 @@ class AllProjectsResource(Resource, ArgsMixin):
                 return [user_service.get_project_by_name(name)]
 
 
-class ProductionTeamResource(Resource, ArgsMixin):
+class ProductionTeamResource(MethodView, ArgsMixin):
     """
     Allow to manage the people listed in a production team.
     """
@@ -205,15 +209,24 @@ class ProductionTeamResource(Resource, ArgsMixin):
                         type: string
                         description: Person email address
                         example: "john.doe@example.com"
+                      project_role:
+                        type: string
+                        nullable: true
+                        description: Person role on this project only. Null
+                          means the person's global role applies.
+                        example: "supervisor"
         """
         user_service.check_project_access(project_id)
         project = projects_service.get_project_raw(project_id)
+        role_map = projects_service.get_team_roles(project_id)
         persons = []
         for person in project.team:
             if permissions.has_manager_permissions():
-                persons.append(person.serialize_safe(relations=True))
+                data = person.serialize_safe(relations=True)
             else:
-                persons.append(person.present_minimal())
+                data = person.present_minimal()
+            data["project_role"] = role_map.get(str(person.id))
+            persons.append(data)
         return persons
 
     @jwt_required()
@@ -247,6 +260,12 @@ class ProductionTeamResource(Resource, ArgsMixin):
                     format: uuid
                     description: Person unique identifier
                     example: b35b7fb5-df86-5776-b181-68564193d36
+                  role:
+                    type: string
+                    nullable: true
+                    description: Role of the person on this project only.
+                      Null means the person's global role applies.
+                    enum: [user, supervisor, manager, client, vendor, null]
         responses:
           201:
             description: Person added to the production team
@@ -271,12 +290,14 @@ class ProductionTeamResource(Resource, ArgsMixin):
 
         user_service.check_manager_project_access(project_id)
         return (
-            projects_service.add_team_member(project_id, body.person_id),
+            projects_service.add_team_member(
+                project_id, body.person_id, role=body.role
+            ),
             201,
         )
 
 
-class ProductionTeamRemoveResource(Resource):
+class ProductionTeamMemberResource(MethodView):
 
     @jwt_required()
     def delete(self, project_id, person_id):
@@ -311,8 +332,53 @@ class ProductionTeamRemoveResource(Resource):
         projects_service.remove_team_member(project_id, person_id)
         return "", 204
 
+    @jwt_required()
+    def put(self, project_id, person_id):
+        """
+        Set team member role
+        ---
+        description: Set the role of a person on this production only.
+                     A null role restores the person's global role.
+        tags:
+          - Projects
+        parameters:
+          - in: path
+            name: project_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+          - in: path
+            name: person_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    nullable: true
+                    enum: [user, supervisor, manager, client, vendor, null]
+        responses:
+          200:
+            description: Role updated
+          400:
+            description: Person is not a member of the project team
+        """
+        body = validation.validate_request_body(ProjectTeamRoleSchema)
+        user_service.check_manager_project_access(project_id)
+        return projects_service.update_team_member_role(
+            project_id, person_id, body.role
+        )
 
-class ProductionAssetTypeResource(Resource, ArgsMixin):
+
+class ProductionAssetTypeResource(MethodView, ArgsMixin):
     """
     Allow to add an asset type linked to a production.
     """
@@ -377,7 +443,7 @@ class ProductionAssetTypeResource(Resource, ArgsMixin):
         return project, 201
 
 
-class ProductionAssetTypeRemoveResource(Resource):
+class ProductionAssetTypeRemoveResource(MethodView):
 
     @jwt_required()
     def delete(self, project_id, asset_type_id):
@@ -413,7 +479,7 @@ class ProductionAssetTypeRemoveResource(Resource):
         return "", 204
 
 
-class ProductionTaskTypesResource(Resource, ArgsMixin):
+class ProductionTaskTypesResource(MethodView, ArgsMixin):
     """
     Retrieve task types linked to the production
     """
@@ -449,7 +515,7 @@ class ProductionTaskTypesResource(Resource, ArgsMixin):
         return projects_service.get_project_task_types(project_id)
 
 
-class ProductionTaskTypeResource(Resource, ArgsMixin):
+class ProductionTaskTypeResource(MethodView, ArgsMixin):
     """
     Allow to add a task type linked to a production.
     """
@@ -518,7 +584,7 @@ class ProductionTaskTypeResource(Resource, ArgsMixin):
         return project, 201
 
 
-class ProductionTaskTypeRemoveResource(Resource):
+class ProductionTaskTypeRemoveResource(MethodView):
     """
     Allow to remove a task type linked to a production.
     """
@@ -557,7 +623,7 @@ class ProductionTaskTypeRemoveResource(Resource):
         return "", 204
 
 
-class ProductionTaskStatusResource(Resource, ArgsMixin):
+class ProductionTaskStatusResource(MethodView, ArgsMixin):
     """
     Allow to add a task type linked to a production.
     """
@@ -652,7 +718,7 @@ class ProductionTaskStatusResource(Resource, ArgsMixin):
         return project, 201
 
 
-class ProductionTaskStatusRemoveResource(Resource):
+class ProductionTaskStatusRemoveResource(MethodView):
     """
     Allow to remove a task status linked to a production.
     """
@@ -691,7 +757,79 @@ class ProductionTaskStatusRemoveResource(Resource):
         return "", 204
 
 
-class ProductionStatusAutomationResource(Resource, ArgsMixin):
+class ProductionSettingsBatchResource(MethodView):
+    """
+    Allow to add several task types, task statuses and asset types to a
+    production in a single request.
+    """
+
+    @jwt_required()
+    def post(self, project_id):
+        """
+        Add settings to production batch
+        ---
+        description: Add several task types (with their priority), task
+          statuses and asset types to a production in a single request,
+          replacing one link request per item. Unknown ids are skipped.
+          When replace_task_types is set, the task type list is the full
+          wanted set and existing links absent from it are removed.
+        tags:
+          - Projects
+        parameters:
+          - in: path
+            name: project_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Project unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_types:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        task_type_id:
+                          type: string
+                          format: uuid
+                        priority:
+                          type: integer
+                  task_status_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                  asset_type_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                  replace_task_types:
+                    type: boolean
+                    default: false
+        responses:
+          200:
+            description: Updated project
+        """
+        body = validation.validate_request_body(ProjectSettingsBatchSchema)
+        user_service.check_manager_project_access(project_id)
+        return projects_service.update_project_settings(
+            project_id,
+            task_types=[entry.model_dump() for entry in body.task_types],
+            task_status_ids=body.task_status_ids,
+            asset_type_ids=body.asset_type_ids,
+            replace_task_types=body.replace_task_types,
+        )
+
+
+class ProductionStatusAutomationResource(MethodView, ArgsMixin):
     """
     Allow to add a status automation linked to a production.
     """
@@ -784,7 +922,7 @@ class ProductionStatusAutomationResource(Resource, ArgsMixin):
         return project, 201
 
 
-class ProductionStatusAutomationRemoveResource(Resource):
+class ProductionStatusAutomationRemoveResource(MethodView):
     """
     Allow to remove a status automation linked to a production.
     """
@@ -825,7 +963,7 @@ class ProductionStatusAutomationRemoveResource(Resource):
         return "", 204
 
 
-class ProductionPreviewBackgroundFileResource(Resource, ArgsMixin):
+class ProductionPreviewBackgroundFileResource(MethodView, ArgsMixin):
     """
     Allow to add a preview background file linked to a production.
     """
@@ -920,7 +1058,7 @@ class ProductionPreviewBackgroundFileResource(Resource, ArgsMixin):
         return project, 201
 
 
-class ProductionPreviewBackgroundFileRemoveResource(Resource):
+class ProductionPreviewBackgroundFileRemoveResource(MethodView):
     """
     Allow to remove a preview background file linked to a production.
     """
@@ -961,7 +1099,7 @@ class ProductionPreviewBackgroundFileRemoveResource(Resource):
         return "", 204
 
 
-class ProductionMetadataDescriptorsResource(Resource, ArgsMixin):
+class ProductionMetadataDescriptorsResource(MethodView, ArgsMixin):
     """
     Resource to get and create metadata descriptors. It serves to describe
     extra fields listed in the data attribute of entities.
@@ -1039,8 +1177,15 @@ class ProductionMetadataDescriptorsResource(Resource, ArgsMixin):
                       - Episode
                       - Sequence
                       - Project
+                      - Task
                     default: "Asset"
                     example: "Asset"
+                  task_type_id:
+                    type: string
+                    format: uuid
+                    description: Task type the descriptor is scoped to.
+                      Required for Task descriptors, forbidden otherwise.
+                    example: a24a6ea4-ce75-4665-a070-57453082c25
                   name:
                     type: string
                     description: Name of the metadata descriptor
@@ -1101,10 +1246,25 @@ class ProductionMetadataDescriptorsResource(Resource, ArgsMixin):
             "Episode",
             "Sequence",
             "Project",
+            "Task",
         ]:
             raise WrongParameterException(
                 "Wrong entity type. Please select Asset, Shot, Sequence, "
-                "Episode, Edit, or Project."
+                "Episode, Edit, Project, or Task."
+            )
+
+        if body.entity_type == "Task":
+            if body.task_type_id is None:
+                raise WrongParameterException(
+                    "Task metadata descriptors require a task_type_id."
+                )
+            try:
+                tasks_service.get_task_type(body.task_type_id)
+            except TaskTypeNotFoundException:
+                raise WrongParameterException("Task type not found.")
+        elif body.task_type_id is not None:
+            raise WrongParameterException(
+                "task_type_id only applies to Task metadata descriptors."
             )
 
         types = [type_name for type_name, _ in METADATA_DESCRIPTOR_TYPES]
@@ -1120,19 +1280,20 @@ class ProductionMetadataDescriptorsResource(Resource, ArgsMixin):
                 body.choices,
                 body.for_client,
                 body.departments,
+                task_type_id=body.task_type_id,
             ),
             201,
         )
 
 
-class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
+class ProductionMetadataDescriptorResource(MethodView, ArgsMixin):
     """
     Resource to get, update or delete a metadata descriptor. Descriptors serve
     to describe extra fields listed in the data attribute of entities.
     """
 
     @jwt_required()
-    def get(self, project_id, descriptor_id):
+    def get(self, project_id, metadata_descriptor_id):
         """
         Get metadata descriptor
         ---
@@ -1150,7 +1311,7 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
             description: Project unique identifier
             example: a24a6ea4-ce75-4665-a070-57453082c25
           - in: path
-            name: descriptor_id
+            name: metadata_descriptor_id
             required: true
             schema:
               type: string
@@ -1166,10 +1327,10 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
                   type: object
         """
         user_service.check_project_access(project_id)
-        return projects_service.get_metadata_descriptor(descriptor_id)
+        return projects_service.get_metadata_descriptor(metadata_descriptor_id)
 
     @jwt_required()
-    def put(self, project_id, descriptor_id):
+    def put(self, project_id, metadata_descriptor_id):
         """
         Update metadata descriptor
         ---
@@ -1187,7 +1348,7 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
             description: Project unique identifier
             example: a24a6ea4-ce75-4665-a070-57453082c25
           - in: path
-            name: descriptor_id
+            name: metadata_descriptor_id
             required: true
             schema:
               type: string
@@ -1233,7 +1394,7 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
         body = validation.validate_request_body(MetadataDescriptorUpdateSchema)
         user_service.check_all_departments_access(
             project_id,
-            projects_service.get_metadata_descriptor(descriptor_id)[
+            projects_service.get_metadata_descriptor(metadata_descriptor_id)[
                 "departments"
             ]
             + body.departments,
@@ -1247,10 +1408,12 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
             raise WrongParameterException("Invalid data_type")
 
         args = body.model_dump()
-        return projects_service.update_metadata_descriptor(descriptor_id, args)
+        return projects_service.update_metadata_descriptor(
+            metadata_descriptor_id, args
+        )
 
     @jwt_required()
-    def delete(self, project_id, descriptor_id):
+    def delete(self, project_id, metadata_descriptor_id):
         """
         Delete metadata descriptor
         ---
@@ -1268,7 +1431,7 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
             description: Project unique identifier
             example: a24a6ea4-ce75-4665-a070-57453082c25
           - in: path
-            name: descriptor_id
+            name: metadata_descriptor_id
             required: true
             schema:
               type: string
@@ -1281,15 +1444,15 @@ class ProductionMetadataDescriptorResource(Resource, ArgsMixin):
         """
         user_service.check_all_departments_access(
             project_id,
-            projects_service.get_metadata_descriptor(descriptor_id)[
+            projects_service.get_metadata_descriptor(metadata_descriptor_id)[
                 "departments"
             ],
         )
-        projects_service.remove_metadata_descriptor(descriptor_id)
+        projects_service.remove_metadata_descriptor(metadata_descriptor_id)
         return "", 204
 
 
-class ProductionMetadataDescriptorsReorderResource(Resource, ArgsMixin):
+class ProductionMetadataDescriptorsReorderResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, project_id):
@@ -1381,10 +1544,11 @@ class ProductionMetadataDescriptorsReorderResource(Resource, ArgsMixin):
             "Episode",
             "Sequence",
             "Project",
+            "Task",
         ]:
             raise WrongParameterException(
                 "Wrong entity type. Please select Asset, Shot, Sequence, "
-                "Episode, Edit, or Project."
+                "Episode, Edit, Project, or Task."
             )
 
         return projects_service.reorder_metadata_descriptors(
@@ -1392,7 +1556,221 @@ class ProductionMetadataDescriptorsReorderResource(Resource, ArgsMixin):
         )
 
 
-class ProductionTimeSpentsResource(Resource):
+VALID_METADATA_ENTITY_TYPES = [
+    "Asset",
+    "Shot",
+    "Edit",
+    "Episode",
+    "Sequence",
+    "Project",
+]
+
+
+def _accessible_open_project_ids():
+    """
+    Open projects the current user can act on: every open project for an
+    admin, only the user's team open projects otherwise. Keeps the
+    all-projects metadata routes from touching projects a manager has no
+    access to.
+    """
+    if permissions.has_admin_permissions():
+        return projects_service.open_project_ids()
+    return [project["id"] for project in user_service.related_projects()]
+
+
+def _check_metadata_entity_type(entity_type):
+    if entity_type not in VALID_METADATA_ENTITY_TYPES:
+        raise WrongParameterException(
+            "Wrong entity type. Please select Asset, Shot, Sequence, "
+            "Episode, Edit, or Project."
+        )
+
+
+class AllProjectsMetadataDescriptorsResource(MethodView):
+
+    @jwt_required()
+    def post(self):
+        """
+        Create a metadata descriptor on all accessible projects
+        ---
+        description: Create the same metadata descriptor in every open
+          project the user can access that does not already own one with the
+          same field name. Replaces one create request per project.
+        tags:
+          - Projects
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - data_type
+                properties:
+                  entity_type:
+                    type: string
+                    default: "Project"
+                  name:
+                    type: string
+                  data_type:
+                    type: string
+        responses:
+          201:
+            description: Created descriptors
+          400:
+            description: Invalid parameters
+        """
+        permissions.check_manager_permissions()
+        body = validation.validate_request_body(MetadataDescriptorSchema)
+        _check_metadata_entity_type(body.entity_type)
+        types = [type_name for type_name, _ in METADATA_DESCRIPTOR_TYPES]
+        if body.data_type not in types:
+            raise WrongParameterException("Invalid data_type")
+        return (
+            projects_service.add_metadata_descriptor_to_projects(
+                _accessible_open_project_ids(),
+                body.entity_type,
+                body.name,
+                body.data_type,
+                body.choices,
+                body.for_client,
+                body.departments,
+            ),
+            201,
+        )
+
+
+class AllProjectsMetadataDescriptorResource(MethodView, ArgsMixin):
+
+    @jwt_required()
+    def put(self, field_name):
+        """
+        Update a metadata descriptor on all accessible projects
+        ---
+        description: Update every metadata descriptor sharing the given field
+          name across the open projects the user can access. Replaces one
+          update request per project.
+        tags:
+          - Projects
+        parameters:
+          - in: path
+            name: field_name
+            required: true
+            schema:
+              type: string
+        responses:
+          200:
+            description: Updated descriptors
+          400:
+            description: Invalid parameters
+        """
+        permissions.check_manager_permissions()
+        body = validation.validate_request_body(
+            AllProjectsMetadataDescriptorUpdateSchema
+        )
+        _check_metadata_entity_type(body.entity_type)
+        types = [type_name for type_name, _ in METADATA_DESCRIPTOR_TYPES]
+        if body.data_type not in types:
+            raise WrongParameterException("Invalid data_type")
+        changes = {
+            "for_client": body.for_client,
+            "data_type": body.data_type,
+            "choices": body.choices,
+            "departments": body.departments,
+        }
+        # Keep the field name untouched when the name is not being changed.
+        if body.name:
+            changes["name"] = body.name
+        return projects_service.update_metadata_descriptor_on_projects(
+            _accessible_open_project_ids(),
+            body.entity_type,
+            field_name,
+            changes,
+        )
+
+    @jwt_required()
+    def delete(self, field_name):
+        """
+        Delete a metadata descriptor from all accessible projects
+        ---
+        description: Remove every metadata descriptor sharing the given field
+          name across the open projects the user can access. Replaces one
+          delete request per project.
+        tags:
+          - Projects
+        parameters:
+          - in: path
+            name: field_name
+            required: true
+            schema:
+              type: string
+          - in: query
+            name: entity_type
+            required: true
+            schema:
+              type: string
+        responses:
+          200:
+            description: Removed descriptor ids
+          400:
+            description: Invalid parameters
+        """
+        permissions.check_manager_permissions()
+        entity_type = self.get_text_parameter("entity_type")
+        _check_metadata_entity_type(entity_type)
+        return projects_service.remove_metadata_descriptor_from_projects(
+            _accessible_open_project_ids(), entity_type, field_name
+        )
+
+
+class AllProjectsMetadataDescriptorsReorderResource(MethodView):
+
+    @jwt_required()
+    def post(self):
+        """
+        Reorder metadata descriptors on all accessible projects
+        ---
+        description: Apply the same column order, given as a list of field
+          names, on every open project the user can access. Replaces one
+          reorder request per project.
+        tags:
+          - Projects
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - entity_type
+                  - field_order
+                properties:
+                  entity_type:
+                    type: string
+                  field_order:
+                    type: array
+                    items:
+                      type: string
+        responses:
+          200:
+            description: Updated descriptors
+          400:
+            description: Invalid parameters
+        """
+        permissions.check_manager_permissions()
+        body = validation.validate_request_body(
+            AllProjectsMetadataDescriptorOrderSchema
+        )
+        _check_metadata_entity_type(body.entity_type)
+        return projects_service.reorder_metadata_descriptors_on_projects(
+            _accessible_open_project_ids(),
+            body.entity_type,
+            body.field_order,
+        )
+
+
+class ProductionTimeSpentsResource(MethodView):
     """
     Resource to retrieve time spents for given production.
     """
@@ -1428,7 +1806,7 @@ class ProductionTimeSpentsResource(Resource):
         return tasks_service.get_time_spents_for_project(project_id)
 
 
-class ProductionMilestonesResource(Resource):
+class ProductionMilestonesResource(MethodView):
     """
     Resource to retrieve milestones for given production.
     """
@@ -1464,7 +1842,7 @@ class ProductionMilestonesResource(Resource):
         return schedule_service.get_milestones_for_project(project_id)
 
 
-class ProductionScheduleItemsResource(Resource):
+class ProductionScheduleItemsResource(MethodView):
     """
     Resource to retrieve schedule items for given production.
     """
@@ -1501,7 +1879,7 @@ class ProductionScheduleItemsResource(Resource):
         return schedule_service.get_schedule_items(project_id)
 
 
-class ProductionTaskTypeScheduleItemsResource(Resource):
+class ProductionTaskTypeScheduleItemsResource(MethodView):
     """
     Resource to retrieve schedule items for given production.
     """
@@ -1538,7 +1916,7 @@ class ProductionTaskTypeScheduleItemsResource(Resource):
         return schedule_service.get_task_types_schedule_items(project_id)
 
 
-class ProductionAssetTypesScheduleItemsResource(Resource):
+class ProductionAssetTypesScheduleItemsResource(MethodView, ArgsMixin):
     """
     Resource to retrieve asset types schedule items for given task type.
     """
@@ -1552,6 +1930,13 @@ class ProductionAssetTypesScheduleItemsResource(Resource):
         tags:
           - Projects
         parameters:
+          - in: query
+            name: episode_id
+            required: false
+            schema:
+              type: string
+              format: uuid
+            description: Restrict results to asset types of the given episode
           - in: path
             name: project_id
             required: true
@@ -1580,12 +1965,15 @@ class ProductionAssetTypesScheduleItemsResource(Resource):
         """
         user_service.check_project_access(project_id)
         user_service.block_access_to_vendor()
+        self.check_id_parameter(project_id)
+        self.check_id_parameter(task_type_id)
+        episode_id = self.get_id_parameter("episode") or None
         return schedule_service.get_asset_types_schedule_items(
-            project_id, task_type_id
+            project_id, task_type_id, episode_id
         )
 
 
-class ProductionEpisodesScheduleItemsResource(Resource, ArgsMixin):
+class ProductionEpisodesScheduleItemsResource(MethodView, ArgsMixin):
     """
     Resource to retrieve episodes schedule items for given task type.
     """
@@ -1599,6 +1987,13 @@ class ProductionEpisodesScheduleItemsResource(Resource, ArgsMixin):
         tags:
           - Projects
         parameters:
+          - in: query
+            name: episode_id
+            required: false
+            schema:
+              type: string
+              format: uuid
+            description: Restrict results to the given episode
           - in: path
             name: project_id
             required: true
@@ -1629,12 +2024,13 @@ class ProductionEpisodesScheduleItemsResource(Resource, ArgsMixin):
         user_service.block_access_to_vendor()
         self.check_id_parameter(project_id)
         self.check_id_parameter(task_type_id)
+        episode_id = self.get_id_parameter("episode") or None
         return schedule_service.get_episodes_schedule_items(
-            project_id, task_type_id
+            project_id, task_type_id, episode_id
         )
 
 
-class ProductionSequencesScheduleItemsResource(Resource):
+class ProductionSequencesScheduleItemsResource(MethodView, ArgsMixin):
     """
     Resource to retrieve sequences schedule items for given task type.
     """
@@ -1648,6 +2044,13 @@ class ProductionSequencesScheduleItemsResource(Resource):
         tags:
           - Projects
         parameters:
+          - in: query
+            name: episode_id
+            required: false
+            schema:
+              type: string
+              format: uuid
+            description: Restrict results to sequences of the given episode
           - in: path
             name: project_id
             required: true
@@ -1676,12 +2079,72 @@ class ProductionSequencesScheduleItemsResource(Resource):
         """
         user_service.check_project_access(project_id)
         user_service.block_access_to_vendor()
+        self.check_id_parameter(project_id)
+        self.check_id_parameter(task_type_id)
+        episode_id = self.get_id_parameter("episode") or None
         return schedule_service.get_sequences_schedule_items(
-            project_id, task_type_id
+            project_id, task_type_id, episode_id
         )
 
 
-class ProductionBudgetsResource(Resource, ArgsMixin):
+class ProductionEditsScheduleItemsResource(MethodView, ArgsMixin):
+    """
+    Resource to retrieve edits schedule items for given task type.
+    """
+
+    @jwt_required()
+    def get(self, project_id, task_type_id):
+        """
+        Get edits schedule items
+        ---
+        description: Retrieve edits schedule items for given task type.
+        tags:
+          - Projects
+        parameters:
+          - in: query
+            name: episode_id
+            required: false
+            schema:
+              type: string
+              format: uuid
+            description: Restrict results to edits of the given episode
+          - in: path
+            name: project_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Project unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: path
+            name: task_type_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Task type unique identifier
+            example: b35b7fb5-df86-5776-b181-68564193d36
+        responses:
+          200:
+            description: All edits schedule items for given task type
+            content:
+              application/json:
+                schema:
+                  type: array
+                  items:
+                    type: object
+        """
+        user_service.check_project_access(project_id)
+        user_service.block_access_to_vendor()
+        self.check_id_parameter(project_id)
+        self.check_id_parameter(task_type_id)
+        episode_id = self.get_id_parameter("episode") or None
+        return schedule_service.get_edits_schedule_items(
+            project_id, task_type_id, episode_id
+        )
+
+
+class ProductionBudgetsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -1781,7 +2244,7 @@ class ProductionBudgetsResource(Resource, ArgsMixin):
         )
 
 
-class ProductionBudgetResource(Resource, ArgsMixin):
+class ProductionBudgetResource(MethodView, ArgsMixin):
     """
     Resource to retrieve a budget for given production.
     """
@@ -1919,7 +2382,7 @@ class ProductionBudgetResource(Resource, ArgsMixin):
         return "", 204
 
 
-class ProductionBudgetEntriesResource(Resource, ArgsMixin):
+class ProductionBudgetEntriesResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id, budget_id):
@@ -2064,7 +2527,7 @@ class ProductionBudgetEntriesResource(Resource, ArgsMixin):
         )
 
 
-class ProductionBudgetEntryResource(Resource, ArgsMixin):
+class ProductionBudgetEntryResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id, budget_id, entry_id):
@@ -2253,7 +2716,7 @@ class ProductionBudgetEntryResource(Resource, ArgsMixin):
         return "", 204
 
 
-class ProductionMonthTimeSpentsResource(Resource, ArgsMixin):
+class ProductionMonthTimeSpentsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -2290,7 +2753,7 @@ class ProductionMonthTimeSpentsResource(Resource, ArgsMixin):
         )
 
 
-class ProductionScheduleVersionTaskLinksResource(Resource, ArgsMixin):
+class ProductionScheduleVersionTaskLinksResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, production_schedule_version_id):
@@ -2334,14 +2797,14 @@ class ProductionScheduleVersionTaskLinksResource(Resource, ArgsMixin):
                 production_schedule_version_id
             )
         )
+        user_service.check_project_access(
+            production_schedule_version["project_id"]
+        )
         if (
             permissions.has_vendor_permissions()
             or permissions.has_client_permissions()
         ):
             raise permissions.PermissionDenied
-        user_service.check_project_access(
-            production_schedule_version["project_id"]
-        )
 
         args = self.get_args(
             [
@@ -2359,7 +2822,7 @@ class ProductionScheduleVersionTaskLinksResource(Resource, ArgsMixin):
 
 
 class ProductionScheduleVersionSetTaskLinksFromTasksResource(
-    Resource, ArgsMixin
+    MethodView, ArgsMixin
 ):
 
     @jwt_required()
@@ -2387,6 +2850,12 @@ class ProductionScheduleVersionSetTaskLinksFromTasksResource(
               application/json:
                 schema:
                   type: object
+                  properties:
+                    success:
+                      type: boolean
+                    task_link_count:
+                      type: integer
+                      description: Number of task links copied
           400:
             description: Wrong ID format
         """
@@ -2404,7 +2873,9 @@ class ProductionScheduleVersionSetTaskLinksFromTasksResource(
         )
 
 
-class ProductionScheduleVersionApplyToProductionResource(Resource, ArgsMixin):
+class ProductionScheduleVersionApplyToProductionResource(
+    MethodView, ArgsMixin
+):
 
     @jwt_required()
     def post(self, production_schedule_version_id):
@@ -2430,6 +2901,12 @@ class ProductionScheduleVersionApplyToProductionResource(Resource, ArgsMixin):
               application/json:
                 schema:
                   type: object
+                  properties:
+                    success:
+                      type: boolean
+                    task_count:
+                      type: integer
+                      description: Number of tasks updated
           400:
             description: Wrong ID format
         """
@@ -2450,7 +2927,7 @@ class ProductionScheduleVersionApplyToProductionResource(Resource, ArgsMixin):
 
 
 class ProductionScheduleVersionSetTaskLinksFromProductionScheduleVersionResource(
-    Resource, ArgsMixin
+    MethodView, ArgsMixin
 ):
 
     @jwt_required()
@@ -2493,6 +2970,12 @@ class ProductionScheduleVersionSetTaskLinksFromProductionScheduleVersionResource
               application/json:
                 schema:
                   type: object
+                  properties:
+                    success:
+                      type: boolean
+                    task_link_count:
+                      type: integer
+                      description: Number of task links copied
           400:
             description: Wrong ID format
         """
@@ -2522,14 +3005,14 @@ class ProductionScheduleVersionSetTaskLinksFromProductionScheduleVersionResource
             )
 
         return schedule_service.set_production_schedule_version_task_links_from_production_schedule_version(
-            production_schedule_version_id,
+            production_schedule_version["id"],
             other_production_schedule_version_id=other_production_schedule_version[
                 "id"
             ],
         )
 
 
-class ProductionTaskTypesTimeSpentsResource(Resource, ArgsMixin):
+class ProductionTaskTypesTimeSpentsResource(MethodView, ArgsMixin):
     """
     Retrieve time spents for a task type in the production
     """
@@ -2622,7 +3105,7 @@ class ProductionTaskTypesTimeSpentsResource(Resource, ArgsMixin):
             )
 
 
-class ProductionDayOffsResource(Resource, ArgsMixin):
+class ProductionDayOffsResource(MethodView, ArgsMixin):
     """
     Retrieve all day offs for a production
     """

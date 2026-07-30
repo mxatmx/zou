@@ -44,8 +44,10 @@ from zou.app import config
 from zou.app.services.exception import (
     AttachmentFileNotFoundException,
     CommentNotFoundException,
+    EntityNotFoundException,
     ModelWithRelationsDeletionException,
     PersonInProtectedAccounts,
+    PreviewBackgroundFileNotFoundException,
     PreviewFileNotFoundException,
 )
 
@@ -88,7 +90,11 @@ def remove_comment(comment_id):
                 {"comment_id": comment.id},
                 project_id=str(task.project_id),
             )
-            return comment.serialize()
+        else:
+            # The task may already be gone; still notify listeners so
+            # they drop the comment from their state.
+            events.emit("comment:delete", {"comment_id": comment.id})
+        return comment.serialize()
     else:
         raise CommentNotFoundException
 
@@ -215,17 +221,22 @@ def remove_preview_file(preview_file, force=False):
     if news is not None:
         news.update({"preview_file_id": None})
 
-    if config.REMOVE_FILES or force:
-        if preview_file.extension == "png":
-            clear_picture_files(preview_file.id)
-        elif preview_file.extension == "mp4":
-            clear_movie_files(preview_file.id)
-        else:
-            clear_generic_files(preview_file.id)
+    preview_file_id = str(preview_file.id)
+    extension = preview_file.extension
 
     preview_file.comments = []
     preview_file.save()
     preview_file.delete()
+
+    # Remove the physical files only once the DB row is gone: if the
+    # delete fails, the row must not end up pointing at missing files.
+    if config.REMOVE_FILES or force:
+        if extension == "png":
+            clear_picture_files(preview_file_id)
+        elif extension == "mp4":
+            clear_movie_files(preview_file_id)
+        else:
+            clear_generic_files(preview_file_id)
 
     # Update last preview file uploaded on task
     if task.last_preview_file_id == preview_file.id:
@@ -258,6 +269,8 @@ def remove_preview_background_file_by_id(
     preview_background_file = PreviewBackgroundFile.get(
         preview_background_file_id
     )
+    if preview_background_file is None:
+        raise PreviewBackgroundFileNotFoundException
     return remove_preview_background_file(preview_background_file, force=force)
 
 
@@ -287,10 +300,13 @@ def remove_attachment_file(attachment_file):
     Remove all files related to given attachment file, then remove the
     attachment file entry from the database.
     """
+    from zou.app.services import comments_service
+
     if config.REMOVE_FILES:
         file_store.remove_file("attachments", str(attachment_file.id))
     attachment_dict = attachment_file.serialize()
     attachment_file.delete()
+    comments_service.clear_attachment_file_cache(attachment_dict["id"])
     return attachment_dict
 
 
@@ -366,6 +382,59 @@ def remove_tasks(project_id, task_ids):
     for task in tasks:
         remove_task(task.id, force=True)
     return task_ids
+
+
+def remove_entities(project_id, entity_ids):
+    """
+    Delete a list of a project's entities, dispatching each to the right
+    removal by its type (asset, shot, edit, concept). Entities with tasks are
+    canceled on first deletion, then removed for real when already canceled;
+    concepts are always removed. Absent entities and entities that do not
+    belong to the project or are not one of those types are skipped.
+    Returns the ids of the entities that were removed.
+    """
+    from zou.app.services import (
+        assets_service,
+        concepts_service,
+        edits_service,
+        entities_service,
+        shots_service,
+    )
+
+    shot_type_id = shots_service.get_shot_type()["id"]
+    edit_type_id = edits_service.get_edit_type()["id"]
+    concept_type_id = concepts_service.get_concept_type()["id"]
+
+    to_remove = []
+    for entity_id in entity_ids:
+        try:
+            entity = entities_service.get_entity(entity_id)
+        except EntityNotFoundException:
+            # Already gone (e.g. deleted by someone else): the deletion is
+            # idempotent, skip it like remove_tasks ignores unknown ids.
+            continue
+        if entity["project_id"] != project_id:
+            continue
+        entity_type_id = entity["entity_type_id"]
+        if entity_type_id == shot_type_id:
+            remove = shots_service.remove_shot
+            force = entity["canceled"]
+        elif entity_type_id == edit_type_id:
+            remove = edits_service.remove_edit
+            force = entity["canceled"]
+        elif entity_type_id == concept_type_id:
+            remove = concepts_service.remove_concept
+            force = True
+        elif assets_service.is_asset_dict(entity):
+            remove = assets_service.remove_asset
+            force = entity["canceled"]
+        else:
+            continue
+        to_remove.append((entity_id, remove, force))
+
+    for entity_id, remove, force in to_remove:
+        remove(entity_id, force=force)
+    return [entity_id for entity_id, _, _ in to_remove]
 
 
 def remove_tasks_for_project_and_task_type(project_id, task_type_id):

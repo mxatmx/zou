@@ -7,15 +7,17 @@ from sqlalchemy_utils import (
     TimezoneType,
     ChoiceType,
 )
-from sqlalchemy import Index
+from sqlalchemy import func, Index
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import validates
 from sqlalchemy.dialects.postgresql import JSONB
 
 from pytz import timezone as pytz_timezone
 from babel import Locale
+from babel.core import UnknownLocaleError
 
 from zou.app.models.serializer import SerializerMixin
+from zou.app.utils import fields
 from zou.app.models.department import Department
 from zou.app.models.base import BaseMixin
 from zou.app import db
@@ -59,6 +61,22 @@ SENIORITY_TYPES = [
     ("junior", "Junior"),
 ]
 
+DISPLAY_DATE_FORMATS = [
+    "YYYY-MM-DD",
+    "DD/MM/YYYY",
+    "MM/DD/YYYY",
+]
+
+SENSITIVE_FIELDS = [
+    "password",
+    "totp_secret",
+    "email_otp_secret",
+    "otp_recovery_codes",
+    "fido_credentials",
+    "fido_devices",
+    "jti",
+]
+
 
 def normalize_country(value):
     """
@@ -85,6 +103,46 @@ def normalize_country(value):
     if len(normalized) == 2 and normalized.isascii() and normalized.isalpha():
         return True, normalized
     return False, None
+
+
+def normalize_locale(value):
+    """
+    Normalize a locale to a name Python Babel can parse back. Returns an
+    ``(is_valid, normalized)`` tuple:
+
+      - ``(True, "en_US")`` for a locale Babel recognizes (any casing and
+        surrounding whitespace); the value is trimmed but kept as-is rather
+        than re-serialized to Babel's canonical form, so ``zh_CN`` is not
+        rewritten to ``zh_Hans_CN`` and stays within the column width;
+      - ``(True, None)`` for an empty or ``None`` value (i.e. "no locale");
+      - ``(False, None)`` for a value Babel cannot parse (unknown locale,
+        malformed identifier, non-string input such as a SAML single-element
+        list) or one too long for the column.
+
+    Single source of truth shared by the API guard (raises 400 on invalid)
+    and the model validator (silently discards invalid). Without it an
+    unparseable value would be stored verbatim and then break every later
+    read of the person, since LocaleType re-parses the stored column value
+    through Babel on load.
+    """
+    if value is None:
+        return True, None
+    if isinstance(value, Locale):
+        return True, str(value)
+    if not isinstance(value, str):
+        return False, None
+    normalized = value.strip()
+    if normalized == "":
+        return True, None
+    # The locale column is a Unicode(10); a longer value would overflow the
+    # column even if Babel accepts it (e.g. the "en_US_POSIX" variant).
+    if len(normalized) > 10:
+        return False, None
+    try:
+        Locale.parse(normalized)
+    except (UnknownLocaleError, ValueError, TypeError):
+        return False, None
+    return True, normalized
 
 
 class DepartmentLink(db.Model):
@@ -205,6 +263,7 @@ class Person(db.Model, BaseMixin, SerializerMixin):
     )
 
     shotgun_id = db.Column(db.Integer, unique=True)
+
     timezone = db.Column(
         TimezoneType(backend="pytz"),
         default=lambda: pytz_timezone(config_store.get_default_timezone()),
@@ -213,7 +272,10 @@ class Person(db.Model, BaseMixin, SerializerMixin):
         LocaleType,
         default=lambda: Locale(config_store.get_default_locale()),
     )
+    use_12_hour_clock = db.Column(db.Boolean(), default=False)
+    display_date_format = db.Column(db.String(20), default="YYYY-MM-DD")
     data = db.Column(JSONB)
+
     role = db.Column(ChoiceType(ROLE_TYPES), default="user", nullable=False)
     position = db.Column(ChoiceType(POSITION_TYPES), default="artist")
     seniority = db.Column(ChoiceType(SENIORITY_TYPES), default="mid")
@@ -233,6 +295,8 @@ class Person(db.Model, BaseMixin, SerializerMixin):
     is_guest = db.Column(db.Boolean(), default=False, nullable=False)
     jti = db.Column(db.String(60), nullable=True, unique=True)
     expiration_date = db.Column(db.Date(), nullable=True)
+    is_generated_from_ldap = db.Column(db.Boolean(), default=False)
+    ldap_uid = db.Column(db.String(60), unique=True, default=None)
 
     departments = db.relationship(
         "Department",
@@ -241,9 +305,6 @@ class Person(db.Model, BaseMixin, SerializerMixin):
     studio_id = db.Column(
         UUIDType(binary=False), db.ForeignKey("studio.id"), index=True
     )
-
-    is_generated_from_ldap = db.Column(db.Boolean(), default=False)
-    ldap_uid = db.Column(db.String(60), unique=True, default=None)
 
     __table_args__ = (
         Index(
@@ -275,6 +336,24 @@ class Person(db.Model, BaseMixin, SerializerMixin):
             )
         return normalized
 
+    @validates("locale")
+    def validate_locale(self, key, value):
+        """
+        Keep only locales Python Babel can parse back. Empty or malformed
+        values are stored as None (the read path then falls back to the
+        default locale). API requests are rejected upstream with a clean
+        400; this is the last-resort guard for direct writes (SSO sign-in,
+        imports, scripts) that never raises. Without it an unparseable value
+        would be persisted verbatim and break every later read of the person,
+        since LocaleType re-parses the stored column through Babel on load.
+        """
+        is_valid, normalized = normalize_locale(value)
+        if not is_valid:
+            logger.warning(
+                f"Discarded invalid locale value for person: {value!r}"
+            )
+        return normalized
+
     @hybrid_property
     def full_name(self):
         if self.first_name and self.last_name:
@@ -284,10 +363,17 @@ class Person(db.Model, BaseMixin, SerializerMixin):
 
     @full_name.expression
     def full_name(cls):
-        if cls.first_name and cls.last_name:
-            return cls.first_name + " " + cls.last_name
-        else:
-            return cls.first_name + cls.last_name
+        # The previous form branched on bool(Column), which is always
+        # true, and produced NULL as soon as one name part was NULL.
+        # concat_ws skips NULLs; nullif maps empty strings to NULL so the
+        # result matches the Python property for every combination.
+        return func.trim(
+            func.concat_ws(
+                " ",
+                func.nullif(cls.first_name, ""),
+                func.nullif(cls.last_name, ""),
+            )
+        )
 
     def fido_devices(self):
         if self.fido_credentials is None:
@@ -300,35 +386,34 @@ class Person(db.Model, BaseMixin, SerializerMixin):
 
     def serialize_safe(self, **kwargs):
         return super().serialize(
-            ignored_attrs=[
-                "password",
-                "totp_secret",
-                "email_otp_secret",
-                "otp_recovery_codes",
-                "fido_credentials",
-                "fido_devices",
-                "jti",
-            ],
+            ignored_attrs=SENSITIVE_FIELDS,
             **kwargs,
         )
 
     def present_minimal(self, relations=False, milliseconds=False):
-        data = SerializerMixin.serialize(
-            self, "Person", relations=relations, milliseconds=milliseconds
-        )
+        """
+        Build the minimal person dict directly: serializing all columns to
+        keep a dozen fields was a hot path (embedded author of every
+        comment and reply).
+        """
+        departments = []
+        if relations:
+            departments = [
+                str(department.id) for department in self.departments
+            ]
         return {
-            "id": data["id"],
-            "type": data["type"],
-            "first_name": data["first_name"],
-            "last_name": data["last_name"],
+            "id": str(self.id),
+            "type": "Person",
+            "first_name": self.first_name,
+            "last_name": self.last_name,
             "full_name": self.full_name,
-            "has_avatar": data["has_avatar"],
-            "active": data["active"],
-            "departments": data.get("departments", []),
-            "studio_id": data["studio_id"],
-            "role": data["role"],
-            "desktop_login": data["desktop_login"],
-            "is_bot": data["is_bot"],
+            "has_avatar": self.has_avatar,
+            "active": self.active,
+            "departments": departments,
+            "studio_id": str(self.studio_id) if self.studio_id else None,
+            "role": fields.serialize_value(self.role),
+            "desktop_login": self.desktop_login,
+            "is_bot": self.is_bot,
         }
 
     def set_departments(self, department_ids):

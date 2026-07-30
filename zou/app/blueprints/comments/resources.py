@@ -1,7 +1,5 @@
-import orjson as json
-
-from flask import abort, request, send_file as flask_send_file, current_app
-from flask_restful import Resource, reqparse
+from flask import request, send_file as flask_send_file, current_app
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app.mixin import ArgsMixin
@@ -11,6 +9,7 @@ from zou.app.services.exception import (
 )
 from zou.app.utils import permissions, date_helpers, validation
 from zou.app.blueprints.comments.schemas import (
+    CommentCreateSchema,
     CommentReplySchema,
     MoveCommentSchema,
 )
@@ -27,7 +26,7 @@ from zou.app.services import (
 from zou.app import config
 
 
-class DownloadAttachmentResource(Resource):
+class DownloadAttachmentResource(MethodView):
 
     @jwt_required()
     def get(self, attachment_file_id, file_name):
@@ -80,6 +79,7 @@ class DownloadAttachmentResource(Resource):
             chat = chats_service.get_chat_by_id(message["chat_id"])
             entity = entities_service.get_entity(chat["object_id"])
             user_service.check_project_access(entity["project_id"])
+            user_service.check_entity_access(chat["object_id"])
         else:
             raise permissions.PermissionDenied()
         try:
@@ -90,7 +90,14 @@ class DownloadAttachmentResource(Resource):
                 file_path,
                 conditional=True,
                 mimetype=attachment_file["mimetype"],
-                as_attachment=False,
+                # Serve safe raster images inline so they display in the
+                # browser; force download for everything else. The mimetype
+                # comes verbatim from the uploader, so serving e.g. HTML/SVG
+                # inline would let an attacker run code in Kitsu's origin
+                # (stored XSS).
+                as_attachment=not comments_service.is_inline_safe_mimetype(
+                    attachment_file["mimetype"]
+                ),
                 download_name=attachment_file["name"],
                 max_age=config.CLIENT_CACHE_MAX_AGE,
                 last_modified=date_helpers.get_datetime_from_string(
@@ -105,7 +112,7 @@ class DownloadAttachmentResource(Resource):
             raise AttachmentFileNotFoundException
 
 
-class AckCommentResource(Resource):
+class AckCommentResource(MethodView):
 
     @jwt_required()
     def post(self, task_id, comment_id):
@@ -153,7 +160,7 @@ class AckCommentResource(Resource):
         return comments_service.acknowledge_comment(comment_id)
 
 
-class CommentTaskResource(Resource):
+class CommentTaskResource(MethodView):
 
     @jwt_required()
     def post(self, task_id):
@@ -282,58 +289,21 @@ class CommentTaskResource(Resource):
         return comment, 201
 
     def get_arguments(self):
-        parser = reqparse.RequestParser()
-        if request.is_json:
-            location = ["values", "json"]
-            parser.add_argument(
-                "checklist",
-                type=dict,
-                action="append",
-                default=[],
-                location=location,
-            )
-            parser.add_argument(
-                "links",
-                type=str,
-                action="append",
-                default=[],
-                location=location,
-            )
-        else:
-            location = "values"
-            parser.add_argument("checklist", default="[]", location=location)
-            parser.add_argument("links", default="[]", location=location)
-        parser.add_argument(
-            "task_status_id",
-            required=True,
-            help="Task Status ID is missing",
-            location=location,
-        )
-        parser.add_argument("comment", default="", location=location)
-        parser.add_argument("person_id", default="", location=location)
-        parser.add_argument("created_at", default="", location=location)
-        parser.add_argument(
-            "for_client", type=bool, default=False, location=location
-        )
-        args = parser.parse_args()
+        body = validation.validate_request_body(CommentCreateSchema)
         return (
-            args["task_status_id"],
-            args["comment"],
-            args["person_id"],
-            args["created_at"],
-            (
-                args["checklist"]
-                if request.is_json
-                else json.loads(args["checklist"])
-            ),
-            (args["links"] if request.is_json else json.loads(args["links"])),
-            args["for_client"],
+            body.task_status_id,
+            body.comment,
+            body.person_id,
+            body.created_at,
+            body.checklist,
+            body.links,
+            body.for_client,
         )
 
 
-class AttachmentResource(Resource):
+class AttachmentResource(MethodView):
     @jwt_required()
-    def delete(self, task_id, comment_id, attachment_id):
+    def delete(self, task_id, comment_id, attachment_file_id):
         """
         Delete comment attachment
         ---
@@ -357,7 +327,7 @@ class AttachmentResource(Resource):
             example: b35b7fb5-df86-5776-b181-68564193d36
             description: Unique identifier of the comment
           - in: path
-            name: attachment_id
+            name: attachment_file_id
             required: true
             type: string
             format: uuid
@@ -375,11 +345,11 @@ class AttachmentResource(Resource):
             task = tasks_service.get_task(task_id)
             user_service.check_manager_project_access(task["project_id"])
 
-        deletion_service.remove_attachment_file_by_id(attachment_id)
+        deletion_service.remove_attachment_file_by_id(attachment_file_id)
         return "", 204
 
 
-class AddAttachmentToCommentResource(Resource):
+class AddAttachmentToCommentResource(MethodView):
     @jwt_required()
     def post(self, task_id, comment_id):
         """
@@ -468,7 +438,7 @@ class AddAttachmentToCommentResource(Resource):
         return comment["attachment_files"], 201
 
 
-class CommentManyTasksResource(Resource):
+class CommentManyTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id):
@@ -608,13 +578,21 @@ class CommentManyTasksResource(Resource):
 
     def get_allowed_comments_only(self, comments, person):
         allowed_comments = []
+        # The person is constant and the comments almost always share one
+        # project: memoize the role lookups instead of querying per comment.
+        role_cache = {}
         for comment in comments:
             try:
                 task = tasks_service.get_task(
                     comment["object_id"], relations=True
                 )
+                project_id = task["project_id"]
+                if project_id not in role_cache:
+                    role_cache[project_id] = user_service.get_project_role(
+                        person["id"], project_id
+                    )
                 if (
-                    person["role"] == "supervisor"
+                    role_cache[project_id] == "supervisor"
                     and (
                         len(person["departments"]) == 0
                         or tasks_service.get_task_type(task["task_type_id"])[
@@ -631,7 +609,7 @@ class CommentManyTasksResource(Resource):
         return allowed_comments
 
 
-class ReplyCommentResource(Resource, ArgsMixin):
+class ReplyCommentResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, task_id, comment_id):
@@ -700,14 +678,18 @@ class ReplyCommentResource(Resource, ArgsMixin):
             raise permissions.PermissionDenied()
         current_user = persons_service.get_current_user()
         if comment["person_id"] != current_user["id"]:
+            user_service.check_task_action_access(task_id)
             if permissions.has_client_permissions():
                 author = persons_service.get_person(comment["person_id"])
+                task = tasks_service.get_task(task_id)
                 if (
                     current_user["studio_id"] != author["studio_id"]
-                    and author["role"] == "client"
+                    and user_service.get_project_role(
+                        author["id"], task["project_id"]
+                    )
+                    == "client"
                 ):
                     raise permissions.PermissionDenied()
-            user_service.check_task_action_access(task_id)
 
         body = validation.validate_request_body(CommentReplySchema)
         files = request.files
@@ -716,7 +698,7 @@ class ReplyCommentResource(Resource, ArgsMixin):
         )
 
 
-class DeleteReplyCommentResource(Resource):
+class DeleteReplyCommentResource(MethodView):
 
     @jwt_required()
     def delete(self, task_id, comment_id, reply_id):
@@ -760,7 +742,7 @@ class DeleteReplyCommentResource(Resource):
         return comments_service.delete_reply(comment_id, reply_id)
 
 
-class ProjectAttachmentFiles(Resource):
+class ProjectAttachmentFiles(MethodView):
 
     @jwt_required()
     def get(self, project_id):
@@ -823,7 +805,7 @@ class ProjectAttachmentFiles(Resource):
         )
 
 
-class TaskAttachmentFiles(Resource):
+class TaskAttachmentFiles(MethodView):
 
     @jwt_required()
     def get(self, task_id):
@@ -889,7 +871,7 @@ class TaskAttachmentFiles(Resource):
         return comments_service.get_all_attachment_files_for_task(task_id)
 
 
-class MoveCommentResource(Resource):
+class MoveCommentResource(MethodView):
 
     @jwt_required()
     def post(self, task_id, comment_id):

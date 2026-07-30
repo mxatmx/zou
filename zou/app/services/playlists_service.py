@@ -35,6 +35,7 @@ from zou.app.stores.redis_lock import with_playlist_lock
 from zou.app.services import (
     assets_service,
     base_service,
+    edits_service,
     entities_service,
     files_service,
     preview_files_service,
@@ -558,6 +559,111 @@ def add_entity_to_playlist(playlist_id, entity_id, preview_file_id=None):
         project_id=playlist_dict["project_id"],
     )
 
+    return playlist_dict
+
+
+def get_latest_preview_file_ids_for_entities(entity_ids, task_type_id=None):
+    """
+    Return a map of entity id to the id of its latest preview file, picking
+    the highest revision (created_at breaks ties within a revision). When
+    task_type_id is set, only preview files uploaded for that task type are
+    considered.
+    """
+    if not entity_ids:
+        return {}
+    query = (
+        PreviewFile.query.join(Task, PreviewFile.task_id == Task.id)
+        .filter(Task.entity_id.in_(entity_ids))
+        .with_entities(PreviewFile.id, Task.entity_id)
+        .order_by(
+            Task.entity_id,
+            PreviewFile.revision.desc(),
+            PreviewFile.created_at.desc(),
+        )
+    )
+    if task_type_id is not None:
+        query = query.filter(Task.task_type_id == task_type_id)
+    latest = {}
+    for preview_file_id, entity_id in query.all():
+        entity_id_str = str(entity_id)
+        if entity_id_str not in latest:
+            latest[entity_id_str] = str(preview_file_id)
+    return latest
+
+
+def add_entities_to_playlist(playlist_id, entities):
+    """
+    Atomically append several (entity, preview) couples to the playlist shots
+    list in a single database write. A playlist entry is the couple
+    (entity_id, preview_file_id): the same entity may appear several times
+    with different previews, so only exact duplicate couples are skipped.
+    When a couple has no preview_file_id, the latest preview for the entity
+    is resolved (highest revision, restricted to the playlist task type when
+    one is set).
+    """
+    couples = [
+        (
+            str(entity["entity_id"]),
+            (
+                str(entity["preview_file_id"])
+                if entity.get("preview_file_id") is not None
+                else None
+            ),
+        )
+        for entity in entities
+    ]
+    with with_playlist_lock(
+        playlist_id, timeout=30, wait_timeout=35
+    ) as _acquired:
+        playlist = Playlist.get(playlist_id)
+        task_type_id = (
+            str(playlist.task_type_id)
+            if playlist.task_type_id is not None
+            else None
+        )
+        entity_ids_to_resolve = [
+            entity_id
+            for entity_id, preview_file_id in couples
+            if preview_file_id is None
+        ]
+        resolved_preview_ids = (
+            get_latest_preview_file_ids_for_entities(
+                entity_ids_to_resolve, task_type_id
+            )
+            if entity_ids_to_resolve
+            else {}
+        )
+        shots = list(playlist.shots or [])
+        present_couples = {
+            (shot.get("entity_id"), shot.get("preview_file_id"))
+            for shot in shots
+        }
+        added_shots = []
+        for entity_id, preview_file_id in couples:
+            if preview_file_id is None:
+                preview_file_id = resolved_preview_ids.get(entity_id)
+            couple = (entity_id, preview_file_id)
+            if couple not in present_couples:
+                shot = {"entity_id": entity_id}
+                if preview_file_id is not None:
+                    shot["preview_file_id"] = preview_file_id
+                shots.append(shot)
+                present_couples.add(couple)
+                added_shots.append(shot)
+        if added_shots:
+            playlist.update({"shots": shots})
+        playlist_dict = playlist.serialize()
+
+    for shot in added_shots:
+        events.emit(
+            "playlist:add_entity",
+            {
+                "playlist_id": playlist_dict["id"],
+                "entity_id": shot["entity_id"],
+                "preview_file_id": shot.get("preview_file_id"),
+            },
+            project_id=playlist_dict["project_id"],
+        )
     return playlist_dict
 
 
@@ -1094,6 +1200,8 @@ def generate_playlisted_entity_from_task(task_id, task_type_links):
         playlisted_entity = get_base_sequence_for_playlist(entity, task_id)
     elif shots_service.is_episode(entity):
         playlisted_entity = get_base_episode_for_playlist(entity, task_id)
+    elif edits_service.is_edit(entity):
+        playlisted_entity = get_base_edit_for_playlist(entity, task_id)
     else:
         playlisted_entity = get_base_asset_for_playlist(entity, task_id)
 
@@ -1188,6 +1296,36 @@ def get_base_shot_for_playlist(entity, task_id):
         "sequence_name": sequence["name"],
         "parent_name": sequence["name"],
     }
+    return playlisted_entity
+
+
+def get_base_edit_for_playlist(entity, task_id):
+    edit = edits_service.get_edit(entity["id"])
+    episode = None
+    try:
+        episode = shots_service.get_episode(edit["parent_id"])
+    except Exception as e:
+        logger.debug(
+            f"No episode for edit parent_id={edit.get('parent_id')}: {e}"
+        )
+    if episode is not None:
+        playlisted_entity = {
+            "id": edit["id"],
+            "name": edit["name"],
+            "preview_file_task_id": task_id,
+            "episode_id": episode["id"],
+            "episode_name": episode["name"],
+            "parent_name": episode["name"],
+        }
+    else:
+        playlisted_entity = {
+            "id": edit["id"],
+            "name": edit["name"],
+            "preview_file_task_id": task_id,
+            "episode_id": "",
+            "episode_name": "",
+            "parent_name": "",
+        }
     return playlisted_entity
 
 

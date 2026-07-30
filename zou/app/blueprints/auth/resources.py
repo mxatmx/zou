@@ -1,18 +1,11 @@
 import hmac
 import secrets
-import urllib.parse
 
 from flask import request, jsonify, current_app, redirect, make_response
-from flask_restful import Resource
-from flask_principal import (
-    Identity,
-    AnonymousIdentity,
-    identity_changed,
-)
+from flask.views import MethodView
 from flask_jwt_extended import (
     jwt_required,
     create_access_token,
-    create_refresh_token,
     set_access_cookies,
     set_refresh_cookies,
     unset_jwt_cookies,
@@ -29,7 +22,6 @@ from zou.app.mixin import ArgsMixin
 from zou.app.utils import auth, emails, permissions, date_helpers, validation
 from zou.app.blueprints.auth.schemas import (
     LoginSchema,
-    RegisterSchema,
     ChangePasswordSchema,
     ResetPasswordSchema,
     SendPasswordResetSchema,
@@ -80,13 +72,8 @@ def _build_2fa_registration_response(response_data, user_id):
     the requires_2fa_setup claim so the user gets full access.
     """
     additional_claims = {"identity_type": "person"}
-    access_token = create_access_token(
-        identity=user_id,
-        additional_claims=additional_claims,
-    )
-    refresh_token = create_refresh_token(
-        identity=user_id,
-        additional_claims=additional_claims,
+    access_token, refresh_token = auth_service.create_auth_tokens(
+        user_id, additional_claims
     )
     response_data["access_token"] = access_token
     response_data["refresh_token"] = refresh_token
@@ -101,7 +88,7 @@ def _build_2fa_registration_response(response_data, user_id):
     return response
 
 
-class AuthenticatedResource(Resource):
+class AuthenticatedResource(MethodView):
 
     @jwt_required()
     def get(self):
@@ -133,7 +120,7 @@ class AuthenticatedResource(Resource):
         }
 
 
-class LogoutResource(Resource):
+class LogoutResource(MethodView):
 
     @jwt_required()
     @permissions.require_person
@@ -149,10 +136,8 @@ class LogoutResource(Resource):
             description: Logout successful
         """
         try:
-            auth_service.logout(get_jwt()["jti"])
-            identity_changed.send(
-                current_app._get_current_object(), identity=AnonymousIdentity()
-            )
+            payload = get_jwt()
+            auth_service.logout(payload["jti"], payload.get("refresh_jti"))
         except KeyError:
             return {"Access token not found."}, 500
 
@@ -166,7 +151,7 @@ class LogoutResource(Resource):
             return logout_data
 
 
-class LoginResource(Resource, ArgsMixin):
+class LoginResource(MethodView, ArgsMixin):
 
     def post(self):
         """
@@ -267,17 +252,8 @@ class LoginResource(Resource, ArgsMixin):
             if requires_2fa_setup:
                 additional_claims["requires_2fa_setup"] = True
 
-            access_token = create_access_token(
-                identity=user["id"],
-                additional_claims=additional_claims,
-            )
-            refresh_token = create_refresh_token(
-                identity=user["id"],
-                additional_claims=additional_claims,
-            )
-            identity_changed.send(
-                current_app._get_current_object(),
-                identity=Identity(user["id"], "person"),
+            access_token, refresh_token = auth_service.create_auth_tokens(
+                user["id"], additional_claims
             )
 
             ip_address = request.environ.get(
@@ -419,7 +395,7 @@ class LoginResource(Resource, ArgsMixin):
         )
 
 
-class RefreshTokenResource(Resource):
+class RefreshTokenResource(MethodView):
     @jwt_required(refresh=True)
     @permissions.require_person
     def get(self):
@@ -445,6 +421,10 @@ class RefreshTokenResource(Resource):
                 ):
                     additional_claims["requires_2fa_setup"] = True
 
+        # Keep the refresh token jti in the new access token so a later
+        # logout still revokes the refresh token.
+        additional_claims["refresh_jti"] = get_jwt()["jti"]
+
         access_token = create_access_token(
             identity=user["id"],
             additional_claims=additional_claims,
@@ -458,91 +438,7 @@ class RefreshTokenResource(Resource):
             return {"access_token": access_token}
 
 
-class RegistrationResource(Resource, ArgsMixin):
-    """
-    Allow a user to register himself to the service.
-    """
-
-    def post(self):
-        """
-        Register new user
-        ---
-        description: Allow a user to register himself to the service.
-        tags:
-            - Authentication
-        requestBody:
-          required: true
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  email:
-                    type: string
-                    format: email
-                    example: admin@example.com
-                    description: User email address
-                  password:
-                    type: string
-                    format: password
-                    description: User password
-                  password_2:
-                    type: string
-                    format: password
-                    description: Password confirmation
-                  first_name:
-                    type: string
-                    description: User first name
-                  last_name:
-                    type: string
-                    description: User last name
-                required:
-                  - email
-                  - password
-                  - password_2
-                  - first_name
-                  - last_name
-        responses:
-          201:
-            description: Registration successful
-          400:
-            description: Invalid password or email
-        """
-        body = validation.validate_request_body(RegisterSchema)
-
-        try:
-            email = auth.validate_email(body.email)
-            auth.validate_password(body.password, body.password_2)
-            password = auth.encrypt_password(body.password)
-            persons_service.create_person(
-                email, password, body.first_name, body.last_name
-            )
-            return {"registration_success": True}, 201
-        except auth.PasswordsNoMatchException:
-            return (
-                {
-                    "error": True,
-                    "message": "Confirmation password doesn't match.",
-                },
-                400,
-            )
-        except auth.PasswordTooShortException:
-            return {"error": True, "message": "Password is too short."}, 400
-        except auth.EmailNotValidException as exception:
-            return {"error": True, "message": str(exception)}, 400
-
-    def get_arguments(self):
-        body = validation.validate_request_body(RegisterSchema)
-        return (
-            body.email,
-            body.password,
-            body.password_2,
-            body.first_name,
-            body.last_name,
-        )
-
-
-class ChangePasswordResource(Resource, ArgsMixin):
+class ChangePasswordResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_person
@@ -606,7 +502,7 @@ class ChangePasswordResource(Resource, ArgsMixin):
             time_string = format_datetime(
                 date_helpers.get_utc_now_datetime(),
                 tzinfo=user["timezone"],
-                locale=user["locale"],
+                locale=locale,
             )
             person_IP = request.headers.get("X-Forwarded-For", None) or ""
             subject = get_email_translation(
@@ -652,7 +548,7 @@ class ChangePasswordResource(Resource, ArgsMixin):
         return (body.old_password, body.password, body.password_2)
 
 
-class ResetPasswordResource(Resource, ArgsMixin):
+class ResetPasswordResource(MethodView, ArgsMixin):
 
     def put(self):
         """
@@ -766,27 +662,20 @@ class ResetPasswordResource(Resource, ArgsMixin):
         """
         body = validation.validate_request_body(SendPasswordResetSchema)
 
+        # Always answer the same way whether or not the account exists or is
+        # active, so this public endpoint cannot be used to enumerate
+        # registered users.
+        generic_response = {"success": "Reset token sent"}
         try:
             user = persons_service.get_person_by_email(body.email)
-            if not user["active"]:
-                return (
-                    {"error": True, "message": "This user is inactive."},
-                    400,
-                )
         except PersonNotFoundException:
-            return (
-                {"error": True, "message": "Email not listed in database."},
-                400,
-            )
+            return generic_response
+        if not user["active"]:
+            return generic_response
 
         token = auth_service.generate_reset_token()
         auth_tokens_store.add(f"reset-token-{body.email}", token, ttl=3600 * 2)
-        params = {"email": body.email, "token": token}
-        query = urllib.parse.urlencode(params)
-        reset_url = (
-            f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
-            f"/reset-change-password?{query}"
-        )
+        reset_url = persons_service.build_password_reset_url(body.email, token)
         locale = user.get("locale") or getattr(
             config, "DEFAULT_LOCALE", "en_US"
         )
@@ -795,7 +684,7 @@ class ResetPasswordResource(Resource, ArgsMixin):
         time_string = format_datetime(
             date_helpers.get_utc_now_datetime(),
             tzinfo=user["timezone"],
-            locale=user["locale"],
+            locale=locale,
         )
         person_IP = request.headers.get("X-Forwarded-For", None) or ""
         organisation = persons_service.get_organisation()
@@ -820,7 +709,7 @@ class ResetPasswordResource(Resource, ArgsMixin):
         return {"success": "Reset token sent"}
 
 
-class TOTPResource(Resource, ArgsMixin):
+class TOTPResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_person
@@ -975,7 +864,7 @@ class TOTPResource(Resource, ArgsMixin):
             )
 
 
-class EmailOTPResource(Resource, ArgsMixin):
+class EmailOTPResource(MethodView, ArgsMixin):
 
     def get(self):
         """
@@ -1178,7 +1067,7 @@ class EmailOTPResource(Resource, ArgsMixin):
             )
 
 
-class FIDOResource(Resource, ArgsMixin):
+class FIDOResource(MethodView, ArgsMixin):
     """
     Resource to allow a user to register/unregister FIDO device or to get a
     challenge for a FIDO device.
@@ -1253,8 +1142,8 @@ class FIDOResource(Resource, ArgsMixin):
             persons_service.get_current_user()["id"]
         )
 
-    @permissions.require_person
     @jwt_required()
+    @permissions.require_person
     def post(self):
         """
         Register FIDO device
@@ -1368,7 +1257,7 @@ class FIDOResource(Resource, ArgsMixin):
             )
 
 
-class RecoveryCodesResource(Resource, ArgsMixin):
+class RecoveryCodesResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_person
@@ -1444,7 +1333,7 @@ class RecoveryCodesResource(Resource, ArgsMixin):
             )
 
 
-class SAMLSSOResource(Resource, ArgsMixin):
+class SAMLSSOResource(MethodView, ArgsMixin):
     def post(self):
         """
         SAML SSO login
@@ -1517,21 +1406,23 @@ class SAMLSSOResource(Resource, ArgsMixin):
         )
 
         if user["active"]:
-            access_token = create_access_token(
-                identity=user["id"],
-                additional_claims={
-                    "identity_type": "person",
-                },
-            )
-            refresh_token = create_refresh_token(
-                identity=user["id"],
-                additional_claims={
-                    "identity_type": "person",
-                },
-            )
-            identity_changed.send(
-                current_app._get_current_object(),
-                identity=Identity(user["id"], "person"),
+            # Honour 2FA enforcement unless SAML sessions are configured
+            # to skip it (e.g. when the identity provider already
+            # enforces MFA), mirroring the OIDC callback.
+            requires_2fa_setup = False
+            if config.ENFORCE_2FA and not config.SAML_SKIP_2FA:
+                if not auth_service.is_user_exempt_from_2fa(user, app):
+                    if not auth_service.person_two_factor_authentication_enabled(
+                        user
+                    ):
+                        requires_2fa_setup = True
+
+            additional_claims = {"identity_type": "person"}
+            if requires_2fa_setup:
+                additional_claims["requires_2fa_setup"] = True
+
+            access_token, refresh_token = auth_service.create_auth_tokens(
+                user["id"], additional_claims
             )
 
             ip_address = request.environ.get(
@@ -1545,7 +1436,7 @@ class SAMLSSOResource(Resource, ArgsMixin):
         return response
 
 
-class SAMLLoginResource(Resource, ArgsMixin):
+class SAMLLoginResource(MethodView, ArgsMixin):
 
     def get(self):
         """
@@ -1587,7 +1478,7 @@ class SAMLLoginResource(Resource, ArgsMixin):
         return redirect(redirect_url, code=302)
 
 
-class OIDCLoginResource(Resource, ArgsMixin):
+class OIDCLoginResource(MethodView, ArgsMixin):
     def get(self):
         """
         OIDC SSO login redirect
@@ -1612,7 +1503,7 @@ class OIDCLoginResource(Resource, ArgsMixin):
         return oidc.get_oidc_client().authorize_redirect(redirect_uri)
 
 
-class OIDCCallbackResource(Resource, ArgsMixin):
+class OIDCCallbackResource(MethodView, ArgsMixin):
     def get(self):
         """
         OIDC SSO callback
@@ -1695,17 +1586,8 @@ class OIDCCallbackResource(Resource, ArgsMixin):
             if requires_2fa_setup:
                 additional_claims["requires_2fa_setup"] = True
 
-            access_token = create_access_token(
-                identity=user["id"],
-                additional_claims=additional_claims,
-            )
-            refresh_token = create_refresh_token(
-                identity=user["id"],
-                additional_claims=additional_claims,
-            )
-            identity_changed.send(
-                current_app._get_current_object(),
-                identity=Identity(user["id"], "person"),
+            access_token, refresh_token = auth_service.create_auth_tokens(
+                user["id"], additional_claims
             )
 
             ip_address = request.environ.get(

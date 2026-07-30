@@ -1,5 +1,4 @@
 import datetime
-import os
 import re
 import random
 import string
@@ -12,6 +11,7 @@ from zou.app.models.attachment_file import AttachmentFile
 from zou.app.models.comment import Comment
 from zou.app.models.department import Department
 from zou.app.models.notification import Notification
+from zou.app.models.person import Person
 from zou.app.models.project import Project
 from zou.app.models.task import Task
 from zou.app.models.task_status import TaskStatus
@@ -57,6 +57,10 @@ def get_attachment_file(attachment_file_id):
     return attachment_file.serialize()
 
 
+def clear_attachment_file_cache(attachment_file_id):
+    cache.cache.delete_memoized(get_attachment_file, attachment_file_id)
+
+
 def get_attachment_file_path(attachment_file):
     """
     Get attachement file path when stored locally.
@@ -70,6 +74,31 @@ def get_attachment_file_path(attachment_file):
         attachment_file["extension"],
         file_size=attachment_file["size"],
     )
+
+
+# Raster image types that are safe to display inline. Paired with the global
+# X-Content-Type-Options: nosniff header, the browser honors the declared type
+# and will not sniff a disguised HTML payload into an executable document.
+# image/svg+xml is deliberately excluded: SVG can embed scripts and would run
+# in Kitsu's origin (stored XSS).
+INLINE_SAFE_MIMETYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/avif",
+}
+
+
+def is_inline_safe_mimetype(mimetype):
+    """
+    Return True when an attachment with this mimetype may be served inline
+    (displayed in the browser) instead of forced as a download.
+    """
+    if not mimetype:
+        return False
+    return mimetype.split(";")[0].strip().lower() in INLINE_SAFE_MIMETYPES
 
 
 def create_comment(
@@ -537,12 +566,27 @@ def create_attachment(comment, uploaded_file, randomize=False, reply_id=None):
     )
     attachment_file_id = str(attachment_file.id)
 
+    # On storage failure, drop the database entry to avoid a ghost
+    # attachment pointing to a missing object; the temporary file is
+    # removed in every case.
     tmp_file_path = fs.save_file(tmp_folder, attachment_file_id, uploaded_file)
-    size = fs.get_file_size(tmp_file_path)
-    attachment_file.update({"size": size})
-    file_store.add_file("attachments", attachment_file_id, tmp_file_path)
-    os.remove(tmp_file_path)
-    return attachment_file.present()
+    try:
+        size = fs.get_file_size(tmp_file_path)
+        attachment_file.update({"size": size})
+        file_store.add_file("attachments", attachment_file_id, tmp_file_path)
+        return attachment_file.present()
+    except Exception:
+        try:
+            attachment_file.delete()
+        except Exception:
+            current_app.logger.error(
+                f"Failed to delete attachment file {attachment_file_id} "
+                f"after a storage failure",
+                exc_info=1,
+            )
+        raise
+    finally:
+        fs.rm_file(tmp_file_path)
 
 
 def get_all_attachment_files_for_project(project_id):
@@ -578,8 +622,11 @@ def acknowledge_comment(comment_id):
     comment = tasks_service.get_comment_raw(comment_id)
     task = tasks_service.get_task(str(comment.object_id))
     project_id = task["project_id"]
-    current_user = persons_service.get_current_user_raw()
-    current_user_id = str(current_user.id)
+    # Reload the person through the session: appending the cached
+    # current_user instance to the relationship raises an identity
+    # conflict when another instance of the row lives in the session.
+    current_user_id = persons_service.get_current_user()["id"]
+    current_user = Person.get(current_user_id)
 
     acknowledgements = fields.serialize_orm_arrays(comment.acknowledgements)
     is_already_ack = current_user_id in acknowledgements

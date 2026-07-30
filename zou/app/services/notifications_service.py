@@ -1,4 +1,5 @@
 from sqlalchemy.exc import StatementError
+from sqlalchemy.sql import func
 
 from zou.app.models.project import Project, ProjectPersonLink
 from zou.app.models.entity import Entity
@@ -6,7 +7,6 @@ from zou.app.models.notification import Notification
 from zou.app.models.person import Person, DepartmentLink
 from zou.app.models.subscription import Subscription
 from zou.app.models.task import Task
-from zou.app.models.task_type import TaskType
 
 from zou.app.services import (
     assets_service,
@@ -176,7 +176,9 @@ def get_mentioned_people(project_id, comment):
     Return all people mentioned in the comment: the one listed via their name
     and the one listed via their department.
     """
-    mentions = comment["mentions"]
+    # Copy the list: appending in place would corrupt the comment dict,
+    # which may come from the cache or be reused by the caller.
+    mentions = list(comment["mentions"])
     for department_id in comment["department_mentions"]:
         persons = projects_service.get_department_team(
             project_id, department_id
@@ -512,7 +514,7 @@ def notify_clients_playlist_ready(
     query = (
         Person.query.join(ProjectPersonLink)
         .filter(Person.is_bot == False)
-        .filter(Person.role == "client")
+        .filter(func.coalesce(ProjectPersonLink.role, Person.role) == "client")
         .filter(ProjectPersonLink.project_id == project_id)
     )
 

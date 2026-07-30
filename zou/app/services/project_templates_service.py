@@ -320,6 +320,30 @@ def remove_task_status_from_template(template_id, task_status_id):
     )
 
 
+def set_template_task_type_priorities(template_id, task_type_ids):
+    """
+    Set the priority of the template's task type links from the given ordered
+    id list (priority = position, 1-based) in a single pass. Returns the
+    updated links.
+    """
+    return [
+        add_task_type_to_template(template_id, task_type_id, priority)
+        for priority, task_type_id in enumerate(task_type_ids, start=1)
+    ]
+
+
+def set_template_task_status_priorities(template_id, task_status_ids):
+    """
+    Set the priority of the template's task status links from the given
+    ordered id list (priority = position, 1-based). Board roles are preserved
+    since only the priority is passed. Returns the updated links.
+    """
+    return [
+        add_task_status_to_template(template_id, task_status_id, priority)
+        for priority, task_status_id in enumerate(task_status_ids, start=1)
+    ]
+
+
 def get_template_asset_types(template_id):
     template = _ensure_template_exists(template_id)
     return [
@@ -535,10 +559,12 @@ def _clean_descriptor_dict(descriptor):
     field_name = descriptor.get("field_name") or slugify.slugify(
         name, separator="_"
     )
+    task_type_id = descriptor.get("task_type_id")
     return {
         "name": name,
         "field_name": field_name,
         "entity_type": descriptor.get("entity_type"),
+        "task_type_id": str(task_type_id) if task_type_id else None,
         "data_type": descriptor.get("data_type"),
         "choices": descriptor.get("choices") or [],
         "for_client": bool(descriptor.get("for_client", False)),
@@ -663,6 +689,11 @@ def _snapshot_descriptors(project_id):
                 "name": descriptor.name,
                 "field_name": descriptor.field_name,
                 "entity_type": descriptor.entity_type,
+                "task_type_id": (
+                    str(descriptor.task_type_id)
+                    if descriptor.task_type_id is not None
+                    else None
+                ),
                 "data_type": (
                     descriptor.data_type.code
                     if descriptor.data_type is not None
@@ -836,9 +867,15 @@ def _create_descriptor_from_snapshot(project_id, descriptor):
     entity_type = descriptor.get("entity_type")
     if not name or not entity_type:
         return None
+    task_type_id = descriptor.get("task_type_id")
+    if entity_type == "Task" and task_type_id is None:
+        return None
 
     existing = MetadataDescriptor.query.filter_by(
-        project_id=project_id, entity_type=entity_type, name=name
+        project_id=project_id,
+        entity_type=entity_type,
+        name=name,
+        task_type_id=task_type_id,
     ).first()
     if existing is not None:
         return existing
@@ -852,6 +889,7 @@ def _create_descriptor_from_snapshot(project_id, descriptor):
             choices=descriptor.get("choices") or [],
             for_client=bool(descriptor.get("for_client", False)),
             departments=descriptor.get("departments") or [],
+            task_type_id=task_type_id,
         )
     except WrongParameterException:
         return None

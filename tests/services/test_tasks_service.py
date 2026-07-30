@@ -155,6 +155,26 @@ class TaskServiceTestCase(ApiDBTestCase):
         self.assertEqual(self.task.assignees[0].id, self.person.id)
         self.assertEqual(self.task.assigner_id, self.assigner.id)
 
+    def test_update_task_resets_dates_on_status_rollback(self):
+        done_status = self.generate_fixture_task_status_done()
+        wip_status = self.generate_fixture_task_status_wip()
+        task = tasks_service.update_task(
+            self.task.id, {"task_status_id": str(done_status.id)}
+        )
+        self.assertIsNotNone(task["done_date"])
+        task = tasks_service.update_task(
+            self.task.id, {"task_status_id": str(wip_status.id)}
+        )
+        self.assertIsNone(task["done_date"])
+        self.assertIsNone(task["end_date"])
+
+    def test_assign_task_is_idempotent(self):
+        self.task.assignees = []
+        self.task.save()
+        tasks_service.assign_task(self.task.id, self.person.id)
+        tasks_service.assign_task(self.task.id, self.person.id)
+        self.assertEqual(len(self.task.assignees), 1)
+
     def test_get_department_from_task(self):
         department = tasks_service.get_department_from_task(self.task.id)
         self.assertEqual(department["name"], "Modeling")
@@ -235,6 +255,34 @@ class TaskServiceTestCase(ApiDBTestCase):
         for task in tasks:
             self.assertEqual(task["assignees"], [person_id])
             self.assertTrue(all(isinstance(a, str) for a in task["assignees"]))
+
+    def test_get_tasks_for_project_loads_only_assignee_ids(self):
+        from sqlalchemy import event
+        from zou.app import db
+
+        person_id = str(self.person.id)
+        statements = []
+
+        def collect(conn, cursor, statement, *args, **kwargs):
+            statements.append(statement)
+
+        engine = db.session.get_bind()
+        event.listen(engine, "before_cursor_execute", collect)
+        try:
+            tasks = tasks_service.get_tasks_for_project(self.project.id)
+        finally:
+            event.remove(engine, "before_cursor_execute", collect)
+
+        assignees = [a for task in tasks for a in task["assignees"]]
+        self.assertIn(person_id, assignees)
+        self.assertTrue(all(isinstance(a, str) for a in assignees))
+
+        person_link_statements = [
+            s for s in statements if "task_person_link" in s.lower()
+        ]
+        self.assertTrue(person_link_statements)
+        for statement in person_link_statements:
+            self.assertNotIn("person.password", statement)
 
     def test_get_task_dicts_for_entity_relations_avoids_n_plus_one(self):
         from sqlalchemy import event
@@ -373,6 +421,26 @@ class TaskServiceTestCase(ApiDBTestCase):
         tasks_service.clear_assignation(task_id)
         task = tasks_service.get_task(task_id, relations=True)
         self.assertEqual(len(task["assignees"]), 0)
+
+    def test_clear_assignation_swallows_stale_data_error(self):
+        from unittest import mock
+        from sqlalchemy.orm.exc import StaleDataError
+
+        task_id = str(self.task.id)
+        tasks_service.assign_task(self.task.id, self.person.id)
+        task = tasks_service.get_task_raw(task_id)
+
+        # A concurrent unassign makes the assignees flush delete a link that is
+        # already gone, which SQLAlchemy reports as StaleDataError. clear_
+        # assignation must treat that as already-cleared, not raise. (The real
+        # rollback path can't be exercised here: the test harness keeps every
+        # fixture in one uncommitted transaction, so any rollback wipes them.)
+        with mock.patch.object(
+            type(task), "update", side_effect=StaleDataError("stale link")
+        ), mock.patch.object(tasks_service, "get_task_raw", return_value=task):
+            result = tasks_service.clear_assignation(task_id)
+
+        self.assertEqual(result["id"], task_id)
 
     def test_get_tasks_for_person(self):
         projects = [self.project.serialize()]

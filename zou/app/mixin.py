@@ -1,4 +1,3 @@
-from flask_restful import reqparse
 from flask import request
 
 from zou.app.utils import date_helpers, fields
@@ -14,16 +13,26 @@ class ArgsMixin(object):
         """
         Retrieve arguments from GET or POST queries.
         """
-        parser = reqparse.RequestParser()
         if location is None:
             location = ["values", "json"] if request.is_json else ["values"]
+        elif isinstance(location, str):
+            location = [location]
 
+        sources = []
+        for source_name in location:
+            if source_name == "json":
+                json_body = request.get_json(silent=True)
+                if isinstance(json_body, dict):
+                    sources.append(json_body)
+            else:
+                sources.append(getattr(request, source_name))
+
+        args = {}
         for descriptor in descriptors:
             action = None
             data_type = str
             required = False
             default = None
-            help = None
 
             if isinstance(descriptor, (list, tuple)):
                 if len(descriptor) == 5:
@@ -46,19 +55,47 @@ class ArgsMixin(object):
                 default = descriptor.get("default", default)
                 action = descriptor.get("action", action)
                 data_type = descriptor.get("type", data_type)
-                help = descriptor.get("help", help)
 
-            parser.add_argument(
-                name,
-                required=required,
-                default=default,
-                action=action,
-                type=data_type,
-                help=help,
-                location=location,
+            args[name] = self._parse_arg(
+                sources, name, default, required, data_type, action
             )
+        return args
 
-        return parser.parse_args()
+    @staticmethod
+    def _parse_arg(sources, name, default, required, data_type, action):
+        """
+        Resolve a single argument against the request sources: first source
+        holding the name wins, values are cast with data_type, and
+        action="append" collects every occurrence as a list.
+        """
+        source = next((s for s in sources if name in s), None)
+        if source is None:
+            if required:
+                raise WrongParameterException(
+                    f"Missing required parameter: {name}"
+                )
+            return default
+
+        def convert(value):
+            if value is None or data_type is None:
+                return value
+            try:
+                return data_type(value)
+            except (TypeError, ValueError):
+                raise WrongParameterException(
+                    f"Wrong value for parameter {name}."
+                )
+
+        if action == "append":
+            if hasattr(source, "getlist"):
+                values = source.getlist(name)
+            else:
+                values = source[name]
+                if not isinstance(values, list):
+                    values = [values]
+            return [convert(value) for value in values]
+
+        return convert(source.get(name))
 
     def clear_empty_fields(self, data, ignored_fields=None):
         """
@@ -75,15 +112,23 @@ class ArgsMixin(object):
         """
         Returns page requested by the user as an integer.
         """
-        options = request.args
-        return int(options.get("page", "-1"))
+        return self.get_integer_parameter("page", -1)
 
     def get_limit(self):
         """
         Returns limit requested by the user as an integer.
         """
-        options = request.args
-        return int(options.get("limit", 0))
+        return self.get_integer_parameter("limit", 0)
+
+    def get_integer_parameter(self, field_name, default=0):
+        """
+        Returns an integer query parameter, raising a 400 error when the
+        value is not a valid integer.
+        """
+        try:
+            return int(request.args.get(field_name, default))
+        except ValueError:
+            raise WrongParameterException(f"{field_name} must be an integer.")
 
     def get_sort_by(self):
         """

@@ -52,6 +52,29 @@ from flask import current_app
 
 TEST_FOLDER = os.path.join("tests", "tmp")
 
+
+def indexer_is_up():
+    """
+    Tell whether an indexer is configured (INDEXER_KEY) and the
+    Meilisearch instance answers, so integration tests are skipped
+    instead of erroring or hanging when it is absent.
+    """
+    import requests
+
+    from zou.app import config
+
+    if config.INDEXER["key"] is None:
+        return False
+    url = (
+        f"{config.INDEXER['protocol']}://{config.INDEXER['host']}"
+        f":{config.INDEXER['port']}/health"
+    )
+    try:
+        return requests.get(url, timeout=1).status_code == 200
+    except requests.RequestException:
+        return False
+
+
 auth_tokens_store.revoked_tokens_store = fakeredis.FakeStrictRedis(
     decode_responses=True
 )
@@ -84,7 +107,15 @@ class ApiTestCase(unittest.TestCase):
         self.app = app.test_client()
         self.base_headers = {}
         self.post_headers = {"Content-type": "application/json"}
-        app.app_context().push()
+        # No mail during tests, whatever the environment says.
+        app.config["MAIL_ENABLED"] = False
+        app_context = app.app_context()
+        app_context.push()
+        self.addCleanup(app_context.pop)
+        # The fakeredis stores are module-level: without a flush, revoked
+        # tokens and config entries leak from one test to the next.
+        self.addCleanup(auth_tokens_store.revoked_tokens_store.flushall)
+        self.addCleanup(config_store.config_store.flushall)
 
         from zou.app.utils import cache
 

@@ -1,12 +1,16 @@
-from flask_restful import Resource
+from flask.views import MethodView
 
 from flask_jwt_extended import jwt_required
 
 from zou.app.blueprints.entities.schemas import CreateEntityTasksSchema
+from zou.app.services.exception import EntityNotFoundException
 from zou.app.services import (
+    deletion_service,
     entities_service,
     news_service,
+    persons_service,
     preview_files_service,
+    projects_service,
     tasks_service,
     time_spents_service,
     user_service,
@@ -14,7 +18,7 @@ from zou.app.services import (
 from zou.app.utils import permissions, validation
 
 
-class EntityNewsResource(Resource):
+class EntityNewsResource(MethodView):
     @jwt_required()
     def get(self, entity_id):
         """
@@ -84,10 +88,11 @@ class EntityNewsResource(Resource):
         """
         entity = entities_service.get_entity(entity_id)
         user_service.check_project_access(entity["project_id"])
+        user_service.check_entity_access(entity_id)
         return news_service.get_news_for_entity(entity_id)
 
 
-class EntityPreviewFilesResource(Resource):
+class EntityPreviewFilesResource(MethodView):
     @jwt_required()
     def get(self, entity_id):
         """
@@ -151,10 +156,11 @@ class EntityPreviewFilesResource(Resource):
         """
         entity = entities_service.get_entity(entity_id)
         user_service.check_project_access(entity["project_id"])
+        user_service.check_entity_access(entity_id)
         return preview_files_service.get_preview_files_for_entity(entity_id)
 
 
-class EntityTimeSpentsResource(Resource):
+class EntityTimeSpentsResource(MethodView):
     @jwt_required()
     def get(self, entity_id):
         """
@@ -215,10 +221,11 @@ class EntityTimeSpentsResource(Resource):
         """
         entity = entities_service.get_entity(entity_id)
         user_service.check_project_access(entity["project_id"])
+        user_service.check_entity_access(entity_id)
         return time_spents_service.get_time_spents_for_entity(entity_id)
 
 
-class EntitiesLinkedWithTasksResource(Resource):
+class EntitiesLinkedWithTasksResource(MethodView):
     @jwt_required()
     def get(self, entity_id):
         """
@@ -297,7 +304,7 @@ class EntitiesLinkedWithTasksResource(Resource):
         return entities_service.get_linked_entities_with_tasks(entity_id)
 
 
-class EntityTaskCreationResource(Resource):
+class EntityTaskCreationResource(MethodView):
     @jwt_required()
     def post(self, entity_id):
         """
@@ -362,3 +369,69 @@ class EntityTaskCreationResource(Resource):
         ]
         tasks = tasks_service.create_tasks_for_entity(entity, task_types)
         return tasks, 201
+
+
+class ProjectDeleteEntitiesResource(MethodView):
+    @jwt_required()
+    def post(self, project_id):
+        """
+        Delete entities batch
+        ---
+        description: Delete assets, shots, edits and concepts given by id
+          list in a single request. Each entity follows the same rules as
+          its single deletion route. Entities with tasks are marked as
+          canceled on first deletion, then removed for real when already
+          canceled; concepts are always removed. Only entity creators or
+          project managers can delete entities.
+        tags:
+          - Entities
+        parameters:
+          - in: path
+            name: project_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Unique identifier of the project
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  format: uuid
+                description: Entity unique identifiers to delete
+        responses:
+          200:
+            description: Ids of the entities that were deleted. Entities that
+              do not belong to the project or are not an asset, a shot, an
+              edit or a concept are skipped.
+            content:
+              application/json:
+                schema:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+        """
+        projects_service.get_project(project_id)
+        entity_ids = validation.validate_id_list()
+        current_user_id = persons_service.get_current_user()["id"]
+
+        # Authorization stays in the resource: creators may delete their own
+        # entities, otherwise project-manager access is required.
+        for entity_id in entity_ids:
+            try:
+                entity = entities_service.get_entity(entity_id)
+            except EntityNotFoundException:
+                # Nothing to authorize for an entity that is already gone.
+                continue
+            if entity["created_by"] == current_user_id:
+                user_service.check_belong_to_project(project_id)
+            else:
+                user_service.check_manager_project_access(project_id)
+
+        return deletion_service.remove_entities(project_id, entity_ids), 200

@@ -6,9 +6,9 @@ import math
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 import ffmpeg
-import opentimelineio as otio
 
 logger = logging.getLogger(__name__)
 loghandler = logging.StreamHandler()
@@ -51,7 +51,9 @@ def generate_thumbnail(movie_path):
     takes a picture at the first frame of the movie.
     """
     file_source_name = os.path.basename(movie_path)
-    file_target_name = f"{file_source_name[:-4]}.png"
+    # Unique suffix: two concurrent processings of the same movie must
+    # not write to the same temp path.
+    file_target_name = f"{file_source_name[:-4]}_{uuid.uuid4().hex}.png"
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
 
     try:
@@ -65,7 +67,7 @@ def generate_thumbnail(movie_path):
         log_ffmpeg_error(e, "an error occured during generate_thumbnail")
         raise (e)
     except Exception:
-        print("Error while generating thumbnail")
+        logger.error("Error while generating thumbnail", exc_info=1)
         raise
     return file_target_path
 
@@ -75,8 +77,12 @@ def extract_frame_from_movie(movie_path, frame_number, movie_fps):
     Extract a frame from the movie given at movie path. It
     takes a picture at the specified time of the movie.
     """
+    import opentimelineio as otio
+
     file_source_name = os.path.basename(movie_path)
-    file_target_name = f"{file_source_name[:-4]}_{frame_number}.png"
+    file_target_name = (
+        f"{file_source_name[:-4]}_{frame_number}_{uuid.uuid4().hex}.png"
+    )
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
 
     frame_time = otio.opentime.RationalTime(
@@ -104,7 +110,7 @@ def generate_tile(movie_path):
     Generates a tile from a movie.
     """
     file_source_name = os.path.basename(movie_path)
-    file_target_name = f"{file_source_name[:-4]}_tile.png"
+    file_target_name = f"{file_source_name[:-4]}_tile_{uuid.uuid4().hex}.png"
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
     video_track = get_video_track(movie_path, "generate_tile")
     duration = get_movie_duration(video_track=video_track)
@@ -255,9 +261,10 @@ def normalize_movie(movie_path, fps, width, height):
     Generates a high def movie and a low def movie.
     """
     file_source_name = os.path.basename(movie_path)
-    file_target_name = f"{file_source_name[:-8]}.mp4"
+    unique_suffix = uuid.uuid4().hex
+    file_target_name = f"{file_source_name[:-8]}_{unique_suffix}.mp4"
     file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
-    low_file_target_name = f"{file_source_name[:-8]}_low.mp4"
+    low_file_target_name = f"{file_source_name[:-8]}_{unique_suffix}_low.mp4"
     low_file_target_path = os.path.join(
         tempfile.gettempdir(), low_file_target_name
     )
@@ -324,7 +331,11 @@ def add_empty_soundtrack(file_path, try_count=1):
 
     duration = None
     try:
-        probe = ffmpeg.probe(tmp_file_path, select_streams="v")
+        # Probe the source movie (tmp_file_path is the not-yet-created
+        # output, just removed above): this original duration is used below
+        # to trim the duplicate frames ffmpeg appends when adding the
+        # empty soundtrack.
+        probe = ffmpeg.probe(file_path, select_streams="v")
         duration = probe["format"]["duration"]
     except Exception:
         pass

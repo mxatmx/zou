@@ -41,6 +41,27 @@ class UnassignTasksSchema(BaseSchema):
     person_id: Optional[str] = None
 
 
+class SetTasksPrioritySchema(BaseSchema):
+    """
+    Body for setting the priority of several tasks.
+    """
+
+    task_ids: List[str] = Field(
+        ..., min_length=1, description="Tasks list required."
+    )
+    priority: int = Field(..., ge=0, description="Priority to set.")
+
+
+class SetTasksMainPreviewSchema(BaseSchema):
+    """
+    Body for setting the main preview of several tasks' entities.
+    """
+
+    task_ids: List[str] = Field(
+        ..., min_length=1, description="Tasks list required."
+    )
+
+
 class AssignTasksSchema(BaseSchema):
     """
     Body for assigning tasks to a person.

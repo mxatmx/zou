@@ -44,6 +44,7 @@ from zou.app.services.exception import (
     AnnotationNotFoundException,
     WrongParameterException,
     PreviewFileNotFoundException,
+    PreviewProcessingFailedException,
     ProjectNotFoundException,
     EpisodeNotFoundException,
 )
@@ -181,11 +182,14 @@ def update_preview_file(preview_file_id, data, silent=False):
 
 
 def update_preview_file_raw(preview_file, data, silent=False):
+    # Read the id while the instance is still live: on StaleDataError,
+    # base.update() rolls the session back, which expires every attribute.
+    # Reading preview_file.id afterwards reloads the (now deleted) row and
+    # raises ObjectDeletedError, masking the real error.
+    preview_file_id = str(preview_file.id)
     try:
         preview_file.update(data)
     except StaleDataError:
-        # Preview file was deleted by another process during update
-        preview_file_id = str(preview_file.id)
         from zou.app import app as current_app
 
         current_app.logger.warning(
@@ -195,12 +199,12 @@ def update_preview_file_raw(preview_file, data, silent=False):
             f"Preview file {preview_file_id} was deleted"
         )
 
-    files_service.clear_preview_file_cache(str(preview_file.id))
+    files_service.clear_preview_file_cache(preview_file_id)
     if not silent:
         task = Task.get(preview_file.task_id)
         events.emit(
             "preview-file:update",
-            {"preview_file_id": str(preview_file.id)},
+            {"preview_file_id": preview_file_id},
             project_id=str(task.project_id),
         )
     return preview_file.serialize()
@@ -221,11 +225,16 @@ def set_preview_file_as_missing(preview_file_id):
     return update_preview_file(preview_file_id, {"status": "missing"})
 
 
-def set_preview_file_as_ready(preview_file_id):
+def _remove_temp_files(*paths):
     """
-    Mark given preview file as ready.
+    Remove movie processing temp files, ignoring the ones already gone.
     """
-    return update_preview_file(preview_file_id, {"status": "ready"})
+    for path in paths:
+        if path is not None:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 def _abort_on_storage_failure(preview_file_id, operation, exc):
@@ -244,6 +253,35 @@ def _abort_on_storage_failure(preview_file_id, operation, exc):
         exc_info=1,
     )
     return set_preview_file_as_broken(preview_file_id)
+
+
+def mark_broken_on_job_failure(
+    job, connection, exc_type, exc_value, traceback
+):
+    """
+    RQ failure callback for the movie normalization job: mark the preview
+    file as broken and drop its temporary file. Without it, a job killed by
+    timeout or a dead worker leaves the preview file stuck on "processing"
+    forever.
+    """
+    from zou.app import app as current_app
+
+    preview_file_id = job.args[0]
+    uploaded_movie_path = job.args[1] if len(job.args) > 1 else None
+    with current_app.app_context():
+        current_app.logger.error(
+            f"Normalization job failed for preview file {preview_file_id}: "
+            f"{exc_value}"
+        )
+        if uploaded_movie_path is not None:
+            _remove_temp_files(uploaded_movie_path)
+        try:
+            set_preview_file_as_broken(preview_file_id)
+        except PreviewFileNotFoundException:
+            current_app.logger.warning(
+                f"Preview file {preview_file_id} was deleted before its "
+                f"failed job could mark it as broken"
+            )
 
 
 def prepare_and_store_movie(
@@ -265,6 +303,7 @@ def prepare_and_store_movie(
                     "source", preview_file_id, uploaded_movie_path
                 )
             except Exception as exc:
+                _remove_temp_files(uploaded_movie_path)
                 return _abort_on_storage_failure(
                     preview_file_id, "source movie upload", exc
                 )
@@ -307,7 +346,9 @@ def prepare_and_store_movie(
                 exc_info=1,
             )
 
+        normalized_movie_path = None
         normalized_movie_low_path = None
+        original_picture_path = None
         try:
             project = get_project_from_preview_file(preview_file_id)
             entity = get_entity_from_preview_file(preview_file_id)
@@ -322,6 +363,7 @@ def prepare_and_store_movie(
                 )
                 time.sleep(2)
                 preview_file = set_preview_file_as_broken(preview_file_id)
+                _remove_temp_files(uploaded_movie_path)
                 return preview_file
 
         fps = get_preview_file_fps(project, entity)
@@ -339,10 +381,8 @@ def prepare_and_store_movie(
                     result = _run_remote_normalize_movie(
                         current_app, preview_file_id, fps, width, height
                     )
-                    if result is True:
-                        err = None
-                    else:
-                        err = result
+                    if result is not True:
+                        raise PreviewProcessingFailedException(result)
 
                     normalized_movie_path = fs.get_file_path_and_file(
                         config,
@@ -363,17 +403,16 @@ def prepare_and_store_movie(
                         width=width,
                         height=height,
                     )
+                    if err:
+                        # The normalized files were never produced: fail
+                        # before storing anything.
+                        raise PreviewProcessingFailedException(err)
                     file_store.add_movie(
                         "previews", preview_file_id, normalized_movie_path
                     )
                     file_store.add_movie(
                         "lowdef", preview_file_id, normalized_movie_low_path
                     )
-                if err:
-                    current_app.logger.error(
-                        f"Fail to normalize: {uploaded_movie_path}"
-                    )
-                    current_app.logger.error(err)
 
                 current_app.logger.info(
                     f"file normalized {normalized_movie_path}"
@@ -384,6 +423,11 @@ def prepare_and_store_movie(
                     current_app.logger.error(exc.stderr)
                 current_app.logger.error("failed", exc_info=1)
                 preview_file = set_preview_file_as_broken(preview_file_id)
+                _remove_temp_files(
+                    uploaded_movie_path,
+                    normalized_movie_path,
+                    normalized_movie_low_path,
+                )
                 return preview_file
         else:
             try:
@@ -394,41 +438,72 @@ def prepare_and_store_movie(
                     "lowdef", preview_file_id, uploaded_movie_path
                 )
             except Exception as exc:
+                _remove_temp_files(uploaded_movie_path)
                 return _abort_on_storage_failure(
                     preview_file_id, "movie upload", exc
                 )
             normalized_movie_path = uploaded_movie_path
 
-        # Build thumbnails (skipped when remote v2+, done by Nomad job)
-        size = movie.get_movie_size(normalized_movie_path)
-        width, height = size
-        file_size = os.path.getsize(normalized_movie_path)
-        duration = movie.get_movie_duration(normalized_movie_path)
+        # Build thumbnails (skipped when remote v2+, done by Nomad job).
+        # Any failure here must mark the preview file as broken: an
+        # uncaught exception would kill the job and leave the status
+        # stuck on "processing" forever.
+        try:
+            size = movie.get_movie_size(normalized_movie_path)
+            width, height = size
+            file_size = os.path.getsize(normalized_movie_path)
+            duration = movie.get_movie_duration(normalized_movie_path)
 
-        remote_handles_thumbnails = is_remote and REMOTE_NORMALIZE_VERSION >= 2
-        if not remote_handles_thumbnails:
-            original_picture_path = movie.generate_thumbnail(
-                normalized_movie_path
+            remote_handles_thumbnails = (
+                is_remote and REMOTE_NORMALIZE_VERSION >= 2
             )
-            thumbnail_utils.turn_into_thumbnail(original_picture_path, size)
-            try:
-                save_variants(preview_file_id, original_picture_path)
-            except Exception as exc:
-                return _abort_on_storage_failure(
-                    preview_file_id, "thumbnail variants upload", exc
+            if not remote_handles_thumbnails:
+                original_picture_path = movie.generate_thumbnail(
+                    normalized_movie_path
                 )
-            current_app.logger.info(
-                f"thumbnail created {original_picture_path}"
-            )
+                thumbnail_utils.turn_into_thumbnail(
+                    original_picture_path, size
+                )
+                try:
+                    save_variants(preview_file_id, original_picture_path)
+                except Exception as exc:
+                    _remove_temp_files(
+                        uploaded_movie_path,
+                        normalized_movie_path,
+                        normalized_movie_low_path,
+                        original_picture_path,
+                    )
+                    return _abort_on_storage_failure(
+                        preview_file_id, "thumbnail variants upload", exc
+                    )
+                current_app.logger.info(
+                    f"thumbnail created {original_picture_path}"
+                )
 
-            # Build tiles
-            try:
-                tile_path = movie.generate_tile(normalized_movie_path)
-                file_store.add_picture("tiles", preview_file_id, tile_path)
-                os.remove(tile_path)
-                current_app.logger.info(f"tile created {tile_path}")
-            except Exception:
-                current_app.logger.error("Failed to create tile", exc_info=1)
+                # Build tiles
+                try:
+                    tile_path = movie.generate_tile(normalized_movie_path)
+                    file_store.add_picture("tiles", preview_file_id, tile_path)
+                    os.remove(tile_path)
+                    current_app.logger.info(f"tile created {tile_path}")
+                except Exception:
+                    current_app.logger.error(
+                        "Failed to create tile", exc_info=1
+                    )
+        except Exception:
+            current_app.logger.error(
+                f"Failed to build thumbnails for preview file "
+                f"{preview_file_id}",
+                exc_info=1,
+            )
+            preview_file = set_preview_file_as_broken(preview_file_id)
+            _remove_temp_files(
+                uploaded_movie_path,
+                normalized_movie_path,
+                normalized_movie_low_path,
+                original_picture_path,
+            )
+            return preview_file
 
         # Remove files and update status
         try:
@@ -492,10 +567,13 @@ def save_variants(preview_file_id, original_picture_path, with_original=True):
     )
     if with_original:
         variants.append(("original", original_picture_path))
-    for prefix, path in variants:
-        file_store.add_picture(prefix, preview_file_id, path)
-        os.remove(path)
-        clear_variant_from_cache(preview_file_id, prefix)
+    try:
+        for prefix, path in variants:
+            file_store.add_picture(prefix, preview_file_id, path)
+            clear_variant_from_cache(preview_file_id, prefix)
+    finally:
+        # A failed upload must not leak the remaining variant files.
+        _remove_temp_files(*[path for _, path in variants])
 
     return variants
 
@@ -1198,6 +1276,9 @@ def _bundle_annotated_frames_into_zip(entries):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for arcname, src_path in entries:
                 zf.write(src_path, arcname=arcname)
+    except Exception:
+        _remove_temp_files(zip_path)
+        raise
     finally:
         _cleanup_entries(entries)
     return zip_path
@@ -1225,6 +1306,9 @@ def _bundle_annotated_frames_into_pdf(entries):
             append_images=tail,
             resolution=150.0,
         )
+    except Exception:
+        _remove_temp_files(pdf_path)
+        raise
     finally:
         for img in images:
             img.close()

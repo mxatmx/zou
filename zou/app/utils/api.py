@@ -1,24 +1,24 @@
-from flask_restful import Api
-from zou.app.utils.flask import output_json
+from flask.views import MethodView
 
 
 def configure_api_from_blueprint(blueprint, route_tuples, decorators=None):
     """
-    Creates a Flask Restful api object based on information from given
-    blueprint. API is configured to return JSON objects.
+    Register route tuples (path, resource class) on the given blueprint.
+    Resources are Flask MethodView classes; JSON serialization of dict and
+    list return values is handled natively by Flask through the app JSON
+    provider (orjson).
 
-    Each blueprint is describe by a list of tuple. Each tuple is composed of a
-    route and the related resource (controller).
+    A resource class may appear in several tuples: extra paths are
+    registered as aliases on the same view (used to keep deprecated
+    routes working after a rename).
     """
-
-    api = Api(blueprint, catch_all_404s=True, decorators=decorators)
-
-    api.representations = {
-        "application/json": output_json,
-    }
-
-    for route_tuple in route_tuples:
-        path, resource = route_tuple
-        api.add_resource(resource, path)
-
-    return api
+    view_funcs = {}
+    for path, resource in route_tuples:
+        view_func = view_funcs.get(resource)
+        if view_func is None:
+            view_func = resource.as_view(resource.__name__)
+            for decorator in decorators or []:
+                view_func = decorator(view_func)
+            view_funcs[resource] = view_func
+        blueprint.add_url_rule(path, view_func=view_func)
+    return blueprint

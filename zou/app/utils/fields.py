@@ -136,6 +136,47 @@ def get_default_date_object(date_string):
 
 def is_valid_id(value):
     """
-    Check if a given string is a valid UUID.
+    Check if a given value is a valid UUID or its string representation.
     """
-    return _UUID_RE.match(value)
+    return _UUID_RE.match(str(value))
+
+
+def serialize_datetime(value):
+    """
+    Serialize a DateTime column value (or None) without the type dispatch
+    of serialize_value: meant for hot loops over known column types.
+    """
+    if value is None:
+        return None
+    return value.replace(microsecond=0).isoformat()
+
+
+def pick_fields(entries, field_names):
+    """
+    Keep only the given field names in each serialized entry (id and type
+    are always kept). Runs after full serialization on purpose: any
+    permission-based field masking has already been applied, so picking
+    can only remove data, never expose it. Unknown names are ignored.
+    """
+    kept = set(field_names) | {"id", "type"}
+    return [
+        {key: value for key, value in entry.items() if key in kept}
+        for entry in entries
+    ]
+
+
+def boolean(value):
+    """
+    Parse "true"/"false" (case insensitive, also "1"/"0"/"on") as a boolean.
+    Meant as a query argument type; raises ValueError on anything else.
+    """
+    if isinstance(value, bool):
+        return value
+    if not value:
+        raise ValueError("boolean type must be non-null")
+    value = value.lower()
+    if value in ("true", "1", "on"):
+        return True
+    if value in ("false", "0"):
+        return False
+    raise ValueError(f"Invalid literal for boolean(): {value}")

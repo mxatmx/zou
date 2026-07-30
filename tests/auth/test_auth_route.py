@@ -121,7 +121,7 @@ class AuthTestCase(ApiDBTestCase):
         self.logout(tokens)
         self.assertIsNotAuthenticated(tokens)
 
-    def test_register(self):
+    def test_register_route_is_gone(self):
         subscription_data = {
             "email": "alice@doe.com",
             "password": "12345678",
@@ -129,68 +129,28 @@ class AuthTestCase(ApiDBTestCase):
             "first_name": "Alice",
             "last_name": "Doe",
         }
-        self.post("auth/register", subscription_data, 201)
-
-        credentials = {
-            "email": subscription_data["email"],
-            "password": subscription_data["password"],
-        }
-        tokens = self.post("auth/login", credentials, 200)
-        self.assertIsAuthenticated(tokens)
-        self.logout(tokens)
-
-    def test_register_bad_email(self):
-        credentials = {
-            "email": "alicedoecom",
-            "password": "12345678",
-            "password_2": "12345678",
-            "first_name": "Alice",
-            "last_name": "Doe",
-        }
-        self.post("auth/register", credentials, 400)
-
-    def test_register_different_password(self):
-        credentials = {
-            "email": "alice@doe.com",
-            "password": "12345678",
-            "password_2": "12345687",
-            "first_name": "Alice",
-            "last_name": "Doe",
-        }
-        self.post("auth/register", credentials, 400)
-
-    def test_register_password_too_short(self):
-        credentials = {
-            "email": "alice@doe.com",
-            "password": "123",
-            "password_2": "123",
-            "first_name": "Alice",
-            "last_name": "Doe",
-        }
-        self.post("auth/register", credentials, 400)
+        response = self.app.post(
+            "auth/register",
+            data=json.dumps(subscription_data),
+            headers={"Content-type": "application/json"},
+        )
+        # With the route removed, nothing matches the path: a plain 404 in
+        # production. Under DEBUG the frontend file-serving catch-all
+        # (/<fs>/<filename>, GET-only) is registered and captures the path, so
+        # the POST is refused with a 405. Either way registration is refused.
+        self.assertIn(response.status_code, (404, 405))
 
     def test_change_password(self):
-        user_data = {
-            "email": "alice@doe.com",
-            "password": "12345678",
-            "password_2": "12345678",
-            "first_name": "Alice",
-            "last_name": "Doe",
-        }
-        credentials = {
-            "email": "alice@doe.com",
-            "password": "12345678",
-        }
-        self.post("auth/register", user_data, 201)
+        credentials = dict(self.credentials)
         tokens = self.post("auth/login", credentials, 200)
         self.assertIsAuthenticated(tokens)
 
         new_password = {
-            "old_password": "12345678",
+            "old_password": credentials["password"],
             "password": "87654321",
             "password_2": "87654321",
         }
-        credentials = {"email": "alice@doe.com", "password": "87654321"}
+        credentials = {"email": credentials["email"], "password": "87654321"}
 
         headers = self.get_auth_headers(tokens)
         headers["Content-type"] = "application/json"
@@ -205,6 +165,26 @@ class AuthTestCase(ApiDBTestCase):
         tokens = self.post("auth/login", credentials, 200)
         self.assertIsAuthenticated(tokens)
         self.logout(tokens)
+
+    def test_logout_revokes_refresh_token(self):
+        tokens = self.post("auth/login", self.credentials, 200)
+        self.logout(tokens)
+        headers = {
+            "Authorization": f"Bearer {tokens.get('refresh_token', None)}"
+        }
+        response = self.app.get("auth/refresh-token", headers=headers)
+        self.assertEqual(response.status_code, 401)
+
+    def test_logout_after_refresh_revokes_refresh_token(self):
+        tokens = self.post("auth/login", self.credentials, 200)
+        refresh_headers = {
+            "Authorization": f"Bearer {tokens.get('refresh_token', None)}"
+        }
+        result = self.app.get("auth/refresh-token", headers=refresh_headers)
+        new_tokens = json.loads(result.data.decode("utf-8"))
+        self.logout(new_tokens)
+        response = self.app.get("auth/refresh-token", headers=refresh_headers)
+        self.assertEqual(response.status_code, 401)
 
     def test_refresh_token(self):
         tokens = self.post("auth/login", self.credentials, 200)
@@ -245,8 +225,11 @@ class AuthTestCase(ApiDBTestCase):
     def test_reset_password(self):
         email = self.user["email"]
         self.assertIsNotAuthenticated({}, code=422)
+        # Unknown and known emails must return the same response so the
+        # endpoint cannot be used to enumerate accounts.
         data = {"email": "fake_email@test.com"}
-        self.post("auth/reset-password", data, 400)
+        response = self.post("auth/reset-password", data, 200)
+        self.assertTrue(response["success"])
         data = {"email": email}
         response = self.post("auth/reset-password", data, 200)
         self.assertTrue(response["success"])
@@ -460,6 +443,37 @@ class Enforce2FATestCase(ApiDBTestCase):
         # New token should access non-auth routes
         new_headers = self.get_auth_headers(new_tokens)
         response = self.app.get("data/persons", headers=new_headers)
+        self.assertEqual(response.status_code, 200)
+
+    def test_disable_totp_with_recovery_code(self):
+        """
+        Disabling TOTP with a recovery code succeeds. Regression: the
+        unsafe current-user path exposes recovery codes as raw bytes, which
+        used to crash when removing the consumed code.
+        """
+        tokens = self.post("auth/login", self.credentials, 200)
+        headers = self.get_auth_headers(tokens)
+        headers["Content-type"] = "application/json"
+
+        response = self.app.put("auth/totp", headers=headers)
+        otp_secret = json.loads(response.data.decode("utf-8"))["otp_secret"]
+        totp = pyotp.TOTP(otp_secret)
+        response = self.app.post(
+            "auth/totp",
+            data=json.dumps({"totp": totp.now()}),
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        recovery_codes = json.loads(response.data.decode("utf-8"))[
+            "otp_recovery_codes"
+        ]
+        persons_service.clear_person_cache()
+
+        response = self.app.delete(
+            "auth/totp",
+            data=json.dumps({"recovery_code": recovery_codes[0]}),
+            headers=headers,
+        )
         self.assertEqual(response.status_code, 200)
 
     def test_exempt_user_gets_unrestricted_tokens(self):
@@ -1064,3 +1078,4 @@ class ChangePasswordErrorsTestCase(ApiDBTestCase):
             ),
             headers=headers,
         )
+        self.assertEqual(response.status_code, 400)

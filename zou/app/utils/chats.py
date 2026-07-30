@@ -1,10 +1,3 @@
-from slack import WebClient as SlackClient
-from matterhook import Webhook
-from discord import (
-    Client as DiscordClient,
-    Intents as DiscordIntents,
-    Embed as DiscordEmbed,
-)
 from zou.app import config
 import asyncio
 import logging
@@ -24,6 +17,8 @@ def send_to_slack(token, userid, message):
     if token:
         if userid:
             try:
+                from slack_sdk import WebClient as SlackClient
+
                 client = SlackClient(token=token)
                 blocks = [
                     {
@@ -53,21 +48,21 @@ def send_to_mattermost(webhook, userid, message):
     if webhook:
         if userid:
             try:
-                arg = webhook.split("/")
-                server = f"{arg[0]}{arg[1]}//{arg[2]}"
-                hook = arg[4]
+                import requests
 
-                # mandatory parameters are url and your webhook API key
-                mwh = Webhook(server, hook)
-                mwh.username = f"Kitsu - {message['project_name']}"
-                mwh.icon_url = (
-                    f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
-                    f"/img/kitsu.b07d6464.png"
-                )
-
-                # send a message to the API_KEY's channel
-                mwh.send(message["message"], channel=f"@{userid}")
-
+                # A Mattermost incoming webhook is a plain POST of a
+                # JSON payload on the webhook URL.
+                payload = {
+                    "text": message["message"],
+                    "channel": f"@{userid}",
+                    "username": f"Kitsu - {message['project_name']}",
+                    "icon_url": (
+                        f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}"
+                        "/img/kitsu.b07d6464.png"
+                    ),
+                }
+                response = requests.post(webhook, json=payload, timeout=30)
+                response.raise_for_status()
             except Exception:
                 logger.error(
                     "Exception when sending a Mattermost notification:",
@@ -82,6 +77,12 @@ def send_to_mattermost(webhook, userid, message):
 
 
 def send_to_discord(token, userid, message):
+    from discord import (
+        Client as DiscordClient,
+        Intents as DiscordIntents,
+        Embed as DiscordEmbed,
+    )
+
     async def send_to_discord_async(token, userid, message):
         intents = DiscordIntents.default()
         intents.members = True

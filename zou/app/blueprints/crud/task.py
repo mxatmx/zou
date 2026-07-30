@@ -16,8 +16,10 @@ from zou.app.services import (
     deletion_service,
     entities_service,
     assets_service,
+    notifications_service,
+    persons_service,
 )
-from zou.app.utils import permissions
+from zou.app.utils import events, permissions
 
 from zou.app.services.exception import WrongTaskTypeForEntityException
 
@@ -221,6 +223,9 @@ class TasksResource(BaseModelsResource, ArgsMixin):
         """
         try:
             data = request.json
+            # task.name is NOT NULL; default it like create_task() does so a
+            # client omitting it gets a task instead of an IntegrityError.
+            data["name"] = data.get("name") or "main"
             is_assignees = "assignees" in data
             assignees = None
 
@@ -440,8 +445,44 @@ class TaskResource(BaseModelResource, ArgsMixin):
     def check_delete_permissions(self, task):
         user_service.check_manager_project_access(task["project_id"])
 
+    def pre_update(self, instance_dict, data):
+        if "assignees" in data:
+            self._previous_assignees = {
+                str(person.id) for person in self.instance.assignees
+            }
+        # Metadata values pile up in the JSONB bag: merge the incoming
+        # dict instead of replacing the whole field, like entities do.
+        if data.get("data"):
+            data["data"] = {**(self.instance.data or {}), **data["data"]}
+        return instance_dict
+
     def post_update(self, instance_dict, data):
         tasks_service.clear_task_cache(instance_dict["id"])
+        # Assignees set through the generic update emit the same events and
+        # assignation notifications as the assign/clear-assignation routes
+        # so that listeners and assignees stay in sync.
+        if "assignees" in data:
+            new_assignees = {
+                str(person.id) for person in self.instance.assignees
+            }
+            previous_assignees = getattr(self, "_previous_assignees", set())
+            project_id = instance_dict["project_id"]
+            current_user_id = persons_service.get_current_user()["id"]
+            for person_id in new_assignees - previous_assignees:
+                events.emit(
+                    "task:assign",
+                    {"task_id": instance_dict["id"], "person_id": person_id},
+                    project_id=project_id,
+                )
+                notifications_service.create_assignation_notification(
+                    instance_dict["id"], person_id, current_user_id
+                )
+            for person_id in previous_assignees - new_assignees:
+                events.emit(
+                    "task:unassign",
+                    {"task_id": instance_dict["id"], "person_id": person_id},
+                    project_id=project_id,
+                )
         return instance_dict
 
     @jwt_required()

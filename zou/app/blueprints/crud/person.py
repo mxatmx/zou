@@ -7,8 +7,10 @@ from zou.app.models.person import (
     Person,
     ROLE_TYPES,
     CONTRACT_TYPES,
+    DISPLAY_DATE_FORMATS,
     TWO_FACTOR_AUTHENTICATION_TYPES,
     normalize_country,
+    normalize_locale,
 )
 from zou.app.services import (
     deletion_service,
@@ -16,6 +18,7 @@ from zou.app.services import (
     persons_service,
 )
 from zou.app.utils import permissions, auth, date_helpers
+from zou.app.utils.fields import serialize_value
 
 from zou.app.blueprints.crud.base import BaseModelsResource, BaseModelResource
 
@@ -39,6 +42,35 @@ def check_country(data):
     if not is_valid:
         raise WrongParameterException(
             "Invalid country code, expected an ISO 3166-1 alpha-2 code."
+        )
+
+
+def check_locale(data):
+    """
+    Reject a locale that Python Babel cannot parse with a clean 400. Empty or
+    missing values are treated as "no locale" and accepted. Without this guard
+    the raw value would be stored and then break every later read of the
+    person, since the model re-parses the locale through Babel on load.
+    """
+    is_valid, _ = normalize_locale(data.get("locale"))
+    if not is_valid:
+        raise WrongParameterException(
+            "Invalid locale, expected a name available in Python Babel "
+            "(e.g. en_US, fr_FR)."
+        )
+
+
+def check_display_date_format(data):
+    """
+    Reject a display date format outside the supported list with a clean
+    400. A missing or null value is treated as "use the default" and
+    accepted.
+    """
+    value = data.get("display_date_format")
+    if value is not None and value not in DISPLAY_DATE_FORMATS:
+        raise WrongParameterException(
+            "Invalid display_date_format, expected one of: "
+            f"{', '.join(DISPLAY_DATE_FORMATS)}."
         )
 
 
@@ -251,10 +283,16 @@ class PersonsResource(BaseModelsResource):
 
         if permissions.has_admin_permissions():
             if self.get_bool_parameter("with_pass_hash"):
-                return [
-                    person.serialize(relations=relations)
-                    for person in query.all()
-                ]
+                # Only the password hash is re-added (needed for Kitsu ->
+                # Kitsu migration). Never expose the 2FA secrets
+                # (totp/email OTP/recovery codes/FIDO) that the full
+                # serialize() would otherwise leak.
+                persons = []
+                for person in query.all():
+                    person_dict = person.serialize_safe(relations=relations)
+                    person_dict["password"] = serialize_value(person.password)
+                    persons.append(person_dict)
+                return persons
             else:
                 return [
                     person.serialize_safe(relations=relations)
@@ -293,6 +331,8 @@ class PersonsResource(BaseModelsResource):
         ]:
             raise WrongParameterException("Invalid contract_type")
         check_country(data)
+        check_locale(data)
+        check_display_date_format(data)
         if "two_factor_authentication" in data and data[
             "two_factor_authentication"
         ] not in [
@@ -342,7 +382,7 @@ class PersonsResource(BaseModelsResource):
         return data
 
     def post_creation(self, instance):
-        instance_dict = instance.serialize(relations=True)
+        instance_dict = instance.serialize_safe(relations=True)
         if instance.is_bot:
             instance_dict["access_token"] = (
                 persons_service.create_access_token_for_raw_person(instance)
@@ -569,6 +609,9 @@ class PersonResource(BaseModelResource, ArgsMixin):
         """
         return super().put(instance_id)
 
+    def serialize_update_response(self, instance):
+        return instance.serialize_safe()
+
     def check_update_permissions(self, instance_dict, data):
         if instance_dict["id"] != persons_service.get_current_user()["id"]:
             permissions.check_admin_permissions()
@@ -600,6 +643,8 @@ class PersonResource(BaseModelResource, ArgsMixin):
         ]:
             raise WrongParameterException("Invalid contract_type")
         check_country(data)
+        check_locale(data)
+        check_display_date_format(data)
         if "two_factor_authentication" in data and data[
             "two_factor_authentication"
         ] not in [
@@ -610,19 +655,23 @@ class PersonResource(BaseModelResource, ArgsMixin):
 
         if "expiration_date" in data and data["expiration_date"] is not None:
             try:
-                if (
-                    datetime.datetime.strptime(
-                        data["expiration_date"], "%Y-%m-%d"
-                    ).date()
-                    < datetime.date.today()
-                ):
-                    raise WrongParameterException(
-                        "Expiration date can't be in the past."
-                    )
-            except WrongParameterException:
-                raise
+                new_expiration_date = datetime.datetime.strptime(
+                    data["expiration_date"], "%Y-%m-%d"
+                ).date()
             except Exception:
                 raise WrongParameterException("Expiration date is not valid.")
+
+            # Reject a past date only when it actually changes. Re-submitting an
+            # already-expired person's own date (e.g. to disable a bot) must
+            # keep working, otherwise expired accounts can never be edited.
+            current_expiration_date = Person.get(instance_id).expiration_date
+            if (
+                new_expiration_date != current_expiration_date
+                and new_expiration_date < datetime.date.today()
+            ):
+                raise WrongParameterException(
+                    "Expiration date can't be in the past."
+                )
 
         if "email" in data:
             try:
@@ -630,13 +679,16 @@ class PersonResource(BaseModelResource, ArgsMixin):
             except auth.EmailNotValidException as e:
                 raise WrongParameterException(str(e))
 
-            existing = Person.query.filter(
-                Person.email == data["email"],
-                Person.id != instance_id,
-                Person.is_bot.isnot(True),
-            ).first()
-            if existing is not None:
-                raise WrongParameterException("Email already in use.")
+            person = Person.get(instance_id)
+            is_bot = data.get("is_bot", person.is_bot)
+            if not is_bot:
+                existing = Person.query.filter(
+                    Person.email == data["email"],
+                    Person.id != instance_id,
+                    Person.is_bot.isnot(True),
+                ).first()
+                if existing is not None:
+                    raise WrongParameterException("Email already in use.")
 
         return data
 
@@ -685,7 +737,18 @@ class PersonResource(BaseModelResource, ArgsMixin):
         instance_dict["departments"] = [
             str(department.id) for department in self.instance.departments
         ]
-        if "expiration_date" in data:
+        regenerate_token = "expiration_date" in data
+        if regenerate_token and data["expiration_date"] is not None:
+            # A past date only yields an already-expired token that get_jti()
+            # then rejects (500/401). Skip regeneration so an expired bot
+            # keeps a stable token and stays editable.
+            regenerate_token = (
+                datetime.datetime.strptime(
+                    data["expiration_date"], "%Y-%m-%d"
+                ).date()
+                >= datetime.date.today()
+            )
+        if regenerate_token:
             instance_dict["access_token"] = (
                 persons_service.create_access_token_for_raw_person(
                     self.instance

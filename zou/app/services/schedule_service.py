@@ -1,24 +1,26 @@
 from datetime import date, timedelta
 from sqlalchemy.exc import StatementError
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import selectinload
-from sqlalchemy import update
+from sqlalchemy.orm import aliased
+from sqlalchemy import Text, and_, cast, delete, func, literal, select, update
 
 
 from zou.app.models.entity import Entity
 from zou.app.models.entity_type import EntityType
 from zou.app.models.milestone import Milestone
 from zou.app.models.schedule_item import ScheduleItem
-from zou.app.models.task import Task
+from zou.app.models.task import Task, TaskPersonLink
 from zou.app.models.task_type import TaskType
 from zou.app.models.production_schedule_version import (
     ProductionScheduleVersion,
     ProductionScheduleVersionTaskLink,
+    ProductionScheduleVersionTaskLinkPersonLink,
 )
 from zou.app.utils import events, fields, cache
 from zou.app.services import (
     assets_service,
     base_service,
+    edits_service,
     shots_service,
     tasks_service,
     projects_service,
@@ -27,6 +29,7 @@ from zou.app import db
 
 from zou.app.services.exception import (
     ProductionScheduleVersionNotFoundException,
+    WrongParameterException,
 )
 
 
@@ -101,21 +104,33 @@ def get_task_types_schedule_items(project_id):
     )
 
 
-def get_asset_types_schedule_items(project_id, task_type_id):
+def get_asset_types_schedule_items(project_id, task_type_id, episode_id=None):
     """
     Return all asset type schedule items for given project. If no schedule item
-    exists for a given asset type, it creates one.
+    exists for a given asset type, it creates one. When an episode is given,
+    results are restricted to the asset types having assets in that episode.
     """
-    asset_types = assets_service.get_asset_types_for_project(project_id)
+    if episode_id is not None:
+        asset_types = assets_service.get_asset_types_for_episode(
+            project_id, episode_id
+        )
+    else:
+        asset_types = assets_service.get_asset_types_for_project(project_id)
     asset_type_map = base_service.get_model_map_from_array(asset_types)
-    existing_schedule_items = set(
+
+    query = (
         ScheduleItem.query.join(
             EntityType, ScheduleItem.object_id == EntityType.id
         )
         .filter(ScheduleItem.project_id == project_id)
         .filter(ScheduleItem.task_type_id == task_type_id)
-        .all()
     )
+    if episode_id is not None:
+        query = query.filter(
+            ScheduleItem.object_id.in_(list(asset_type_map.keys()))
+        )
+    existing_schedule_items = set(query.all())
+
     return get_entity_schedule_items(
         project_id,
         task_type_id,
@@ -125,21 +140,30 @@ def get_asset_types_schedule_items(project_id, task_type_id):
     )
 
 
-def get_episodes_schedule_items(project_id, task_type_id):
+def get_episodes_schedule_items(project_id, task_type_id, episode_id=None):
     """
     Return all episode schedule items for given project. If no schedule item
-    exists for a given asset type, it creates one.
+    exists for a given episode, it creates one. When an episode is given,
+    results are restricted to that episode.
     """
     episode_type = shots_service.get_episode_type()
     episodes = shots_service.get_episodes_for_project(project_id)
+    if episode_id is not None:
+        episodes = [
+            episode for episode in episodes if episode["id"] == str(episode_id)
+        ]
     episodes_map = base_service.get_model_map_from_array(episodes)
-    existing_schedule_items = set(
+
+    query = (
         ScheduleItem.query.join(Entity, ScheduleItem.object_id == Entity.id)
         .filter(ScheduleItem.project_id == project_id)
         .filter(Entity.entity_type_id == episode_type["id"])
         .filter(ScheduleItem.task_type_id == task_type_id)
-        .all()
     )
+    if episode_id is not None:
+        query = query.filter(ScheduleItem.object_id == episode_id)
+    existing_schedule_items = set(query.all())
+
     return get_entity_schedule_items(
         project_id,
         task_type_id,
@@ -151,13 +175,17 @@ def get_episodes_schedule_items(project_id, task_type_id):
 
 def get_sequences_schedule_items(project_id, task_type_id, episode_id=None):
     """
-    Return all asset type schedule items for given project. If no schedule item
-    exists for a given asset type, it creates one.
+    Return all sequence schedule items for given project. If no schedule item
+    exists for a given sequence, it creates one. When an episode is given,
+    results are restricted to the sequences of that episode.
     """
+    sequences = shots_service.get_sequences_for_project(project_id)
     if episode_id is not None:
-        sequences = shots_service.get_sequences_for_episode(episode_id)
-    else:
-        sequences = shots_service.get_sequences_for_project(project_id)
+        sequences = [
+            sequence
+            for sequence in sequences
+            if sequence["parent_id"] == str(episode_id)
+        ]
     sequence_map = base_service.get_model_map_from_array(sequences)
     sequence_type = shots_service.get_sequence_type()
 
@@ -176,6 +204,41 @@ def get_sequences_schedule_items(project_id, task_type_id, episode_id=None):
         task_type_id,
         sequences,
         sequence_map,
+        existing_schedule_items,
+    )
+
+
+def get_edits_schedule_items(project_id, task_type_id, episode_id=None):
+    """
+    Return all edit schedule items for given project. If no schedule item
+    exists for a given edit, it creates one. Canceled edits are ignored.
+    When an episode is given, results are restricted to the edits of that
+    episode.
+    """
+    edits = edits_service.get_edits_for_project(project_id)
+    edits = [edit for edit in edits if not edit["canceled"]]
+    if episode_id is not None:
+        edits = [
+            edit for edit in edits if edit["parent_id"] == str(episode_id)
+        ]
+    edit_map = base_service.get_model_map_from_array(edits)
+    edit_type = edits_service.get_edit_type()
+
+    query = (
+        ScheduleItem.query.join(Entity, ScheduleItem.object_id == Entity.id)
+        .filter(ScheduleItem.project_id == project_id)
+        .filter(Entity.entity_type_id == edit_type["id"])
+        .filter(ScheduleItem.task_type_id == task_type_id)
+    )
+    if episode_id is not None:
+        query = query.filter(Entity.parent_id == episode_id)
+    existing_schedule_items = set(query.all())
+
+    return get_entity_schedule_items(
+        project_id,
+        task_type_id,
+        edits,
+        edit_map,
         existing_schedule_items,
     )
 
@@ -300,6 +363,94 @@ def update_production_schedule_version(production_schedule_version_id, data):
     return production_schedule_version.serialize()
 
 
+def _generate_task_link_id():
+    """
+    Per-row UUID expression for the INSERT ... SELECT copies. gen_random_uuid()
+    is a core built-in only from PostgreSQL 13 (the CI matrix still covers
+    PostgreSQL 12), and a Python-side default (fields.gen_uuid) is evaluated
+    once per from_select batch, so every row would share the same primary key.
+    md5(text) has been core since well before any PostgreSQL version we
+    support, and applied to random() || clock_timestamp() it yields a
+    distinct uuid per row.
+    """
+    return cast(
+        func.md5(
+            func.concat(
+                cast(func.random(), Text),
+                cast(func.clock_timestamp(), Text),
+            )
+        ),
+        ProductionScheduleVersionTaskLink.id.type,
+    )
+
+
+def _upsert_task_links_from_select(source_select):
+    """
+    Upsert the target version task links from a select yielding, in order, the
+    generated id, the target production schedule version id, the task id and
+    the copied start_date, due_date and estimation. The whole copy runs in the
+    database (INSERT ... SELECT), so it scales to productions with tens of
+    thousands of tasks without loading them into Python. Returns the number
+    of task links copied, taken from the statement RETURNING rows (rowcount
+    is unreliable for INSERT ... SELECT).
+    """
+    tl = ProductionScheduleVersionTaskLink
+    insert_stmt = insert(tl).from_select(
+        [
+            tl.id,
+            tl.production_schedule_version_id,
+            tl.task_id,
+            tl.start_date,
+            tl.due_date,
+            tl.estimation,
+        ],
+        source_select,
+    )
+    insert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=["production_schedule_version_id", "task_id"],
+        set_={
+            "start_date": insert_stmt.excluded.start_date,
+            "due_date": insert_stmt.excluded.due_date,
+            "estimation": insert_stmt.excluded.estimation,
+        },
+    ).returning(tl.id)
+    result = db.session.execute(insert_stmt)
+    return len(result.all())
+
+
+def _replace_task_link_assignees(refreshed_link_ids, person_source):
+    """
+    Refresh the assignees of the task links selected by refreshed_link_ids
+    (a select of task link ids) with the rows from person_source, a select
+    yielding (task_link_id, person_id). The delete is scoped to the refreshed
+    links only, so task links left untouched by the copy keep their assignees.
+    Runs in the database so it stays cheap whatever the number of assignees.
+    """
+    pl = ProductionScheduleVersionTaskLinkPersonLink
+    db.session.execute(
+        delete(pl).where(
+            pl.production_schedule_version_task_link_id.in_(refreshed_link_ids)
+        )
+    )
+    db.session.execute(
+        insert(pl)
+        .from_select(
+            [pl.production_schedule_version_task_link_id, pl.person_id],
+            person_source,
+        )
+        .on_conflict_do_nothing()
+    )
+
+
+def _build_task_links_summary(task_link_count):
+    """
+    Lightweight response for the set-task-links actions: the clients discard
+    the payload, so avoid serializing the (possibly tens of thousands of) task
+    links and just report the number of copied links.
+    """
+    return {"success": True, "task_link_count": task_link_count}
+
+
 def set_production_schedule_version_task_links_from_production(
     production_schedule_version_id,
 ):
@@ -311,44 +462,37 @@ def set_production_schedule_version_task_links_from_production(
         production_schedule_version_id
     )
 
-    tasks = (
-        db.session.query(Task)
-        .options(selectinload(Task.assignees))
-        .filter(Task.project_id == production_schedule_version["project_id"])
-        .all()
+    tl = ProductionScheduleVersionTaskLink
+    copied_count = _upsert_task_links_from_select(
+        select(
+            _generate_task_link_id(),
+            literal(
+                production_schedule_version_id,
+                tl.production_schedule_version_id.type,
+            ),
+            Task.id,
+            Task.start_date,
+            Task.due_date,
+            Task.estimation,
+        ).where(Task.project_id == production_schedule_version["project_id"])
     )
 
-    rows = [
-        {
-            "id": fields.gen_uuid(),
-            "production_schedule_version_id": production_schedule_version_id,
-            "task_id": task.id,
-            "start_date": task.start_date,
-            "due_date": task.due_date,
-            "estimation": task.estimation,
-        }
-        for task in tasks
-    ]
-    insert_stmt = insert(ProductionScheduleVersionTaskLink).values(rows)
-    insert_stmt = insert_stmt.on_conflict_do_update(
-        index_elements=["production_schedule_version_id", "task_id"],
-        set_={
-            "start_date": insert_stmt.excluded.start_date,
-            "due_date": insert_stmt.excluded.due_date,
-            "estimation": insert_stmt.excluded.estimation,
-        },
-    ).returning(ProductionScheduleVersionTaskLink)
-
-    results = db.session.execute(insert_stmt).scalars().all()
-
-    tasks_map = {task.id: task for task in tasks}
-
-    for task_link in results:
-        task_link.assignees = tasks_map[task_link.task_id].assignees
+    # Every project task is a copy source, so all target links are refreshed.
+    _replace_task_link_assignees(
+        select(tl.id).where(
+            tl.production_schedule_version_id == production_schedule_version_id
+        ),
+        select(tl.id, TaskPersonLink.person_id)
+        .join(TaskPersonLink, TaskPersonLink.task_id == tl.task_id)
+        .where(
+            tl.production_schedule_version_id
+            == production_schedule_version_id
+        ),
+    )
 
     db.session.commit()
 
-    return fields.serialize_models(results, relations=True)
+    return _build_task_links_summary(copied_count)
 
 
 def set_production_schedule_version_task_links_from_production_schedule_version(
@@ -357,44 +501,59 @@ def set_production_schedule_version_task_links_from_production_schedule_version(
     """
     Set task links for given production schedule version from another.
     """
+    if production_schedule_version_id == other_production_schedule_version_id:
+        raise WrongParameterException(
+            "A production schedule version cannot be copied onto itself."
+        )
 
-    other_links = (
-        db.session.query(ProductionScheduleVersionTaskLink)
-        .filter(
-            ProductionScheduleVersionTaskLink.production_schedule_version_id
+    tl = ProductionScheduleVersionTaskLink
+    other_tl = aliased(ProductionScheduleVersionTaskLink)
+    pl = ProductionScheduleVersionTaskLinkPersonLink
+
+    copied_count = _upsert_task_links_from_select(
+        select(
+            _generate_task_link_id(),
+            literal(
+                production_schedule_version_id,
+                tl.production_schedule_version_id.type,
+            ),
+            other_tl.task_id,
+            other_tl.start_date,
+            other_tl.due_date,
+            other_tl.estimation,
+        ).where(
+            other_tl.production_schedule_version_id
             == other_production_schedule_version_id
         )
-        .all()
     )
 
-    rows = [
-        {
-            "id": fields.gen_uuid(),
-            "production_schedule_version_id": production_schedule_version_id,
-            "task_id": links.task_id,
-            "start_date": links.start_date,
-            "due_date": links.due_date,
-            "estimation": links.estimation,
-        }
-        for links in other_links
-    ]
-
-    insert_stmt = insert(ProductionScheduleVersionTaskLink).values(rows)
-    insert_stmt = insert_stmt.on_conflict_do_update(
-        index_elements=["production_schedule_version_id", "task_id"],
-        set_={
-            "start_date": insert_stmt.excluded.start_date,
-            "due_date": insert_stmt.excluded.due_date,
-            "estimation": insert_stmt.excluded.estimation,
-        },
-    ).returning(ProductionScheduleVersionTaskLink)
-
-    results = db.session.execute(insert_stmt).scalars().all()
-
-    tasks_map = {link.task_id: link for link in other_links}
-
-    for task_link in results:
-        task_link.assignees = tasks_map[task_link.task_id].assignees
+    # Only the links whose task exists in the source version are refreshed;
+    # target links absent from the source keep their assignees.
+    source_task_ids = select(other_tl.task_id).where(
+        other_tl.production_schedule_version_id
+        == other_production_schedule_version_id
+    )
+    _replace_task_link_assignees(
+        select(tl.id).where(
+            tl.production_schedule_version_id
+            == production_schedule_version_id,
+            tl.task_id.in_(source_task_ids),
+        ),
+        select(tl.id, pl.person_id)
+        .join(
+            other_tl,
+            and_(
+                other_tl.task_id == tl.task_id,
+                other_tl.production_schedule_version_id
+                == other_production_schedule_version_id,
+            ),
+        )
+        .join(pl, pl.production_schedule_version_task_link_id == other_tl.id)
+        .where(
+            tl.production_schedule_version_id
+            == production_schedule_version_id
+        ),
+    )
 
     db.session.commit()
 
@@ -403,7 +562,7 @@ def set_production_schedule_version_task_links_from_production_schedule_version(
         {"production_schedule_from": other_production_schedule_version_id},
     )
 
-    return fields.serialize_models(results, relations=True)
+    return _build_task_links_summary(copied_count)
 
 
 def apply_production_schedule_version_to_production(
@@ -425,18 +584,18 @@ def apply_production_schedule_version_to_production(
             ProductionScheduleVersionTaskLink.production_schedule_version_id
             == production_schedule_version_id
         )
-        .returning(Task)
+        .returning(Task.id, Task.project_id)
     )
 
-    results = db.session.execute(stmt).scalars().all()
+    updated_tasks = db.session.execute(stmt).all()
 
     db.session.commit()
 
-    for task in results:
+    for task_id, project_id in updated_tasks:
         events.emit(
             "task:update",
-            {"task_id": str(task.id)},
-            project_id=str(task.project_id),
+            {"task_id": str(task_id)},
+            project_id=str(project_id),
         )
 
     production_schedule_version = update_production_schedule_version(
@@ -448,4 +607,4 @@ def apply_production_schedule_version_to_production(
         {"from_schedule_version_id": production_schedule_version_id},
     )
 
-    return fields.serialize_models(results, relations=True)
+    return {"success": True, "task_count": len(updated_tasks)}

@@ -1,21 +1,14 @@
-import sys
-import redis
+import logging
 
 from zou.app import config
+from zou.app.stores import redis_client
 
-try:
-    revoked_tokens_store = redis.StrictRedis(
-        host=config.KEY_VALUE_STORE["host"],
-        port=config.KEY_VALUE_STORE["port"],
-        db=config.AUTH_TOKEN_BLACKLIST_KV_INDEX,
-        password=config.KEY_VALUE_STORE["password"],
-        decode_responses=True,
-    )
-    revoked_tokens_store.ping()
-except redis.ConnectionError:
-    revoked_tokens_store = None
-    if "pytest" not in sys.modules:
-        print("Cannot access to the required Redis instance")
+logger = logging.getLogger(__name__)
+
+# Lazily connected: the pool opens on the first command, not at import.
+revoked_tokens_store = redis_client.get_client(
+    config.AUTH_TOKEN_BLACKLIST_KV_INDEX
+)
 
 
 def add(key, token, ttl=None):

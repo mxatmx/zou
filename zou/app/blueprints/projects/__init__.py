@@ -5,7 +5,7 @@ from zou.app.blueprints.projects.resources import (
     AllProjectsResource,
     OpenProjectsResource,
     ProductionTeamResource,
-    ProductionTeamRemoveResource,
+    ProductionTeamMemberResource,
     ProductionAssetTypeResource,
     ProductionAssetTypeRemoveResource,
     ProductionPreviewBackgroundFileResource,
@@ -15,15 +15,20 @@ from zou.app.blueprints.projects.resources import (
     ProductionTaskTypesResource,
     ProductionTaskStatusResource,
     ProductionTaskStatusRemoveResource,
+    ProductionSettingsBatchResource,
     ProductionStatusAutomationResource,
     ProductionStatusAutomationRemoveResource,
     ProductionMetadataDescriptorResource,
     ProductionMetadataDescriptorsResource,
     ProductionMetadataDescriptorsReorderResource,
+    AllProjectsMetadataDescriptorsResource,
+    AllProjectsMetadataDescriptorResource,
+    AllProjectsMetadataDescriptorsReorderResource,
     ProductionMilestonesResource,
     ProductionScheduleItemsResource,
     ProductionTaskTypeScheduleItemsResource,
     ProductionAssetTypesScheduleItemsResource,
+    ProductionEditsScheduleItemsResource,
     ProductionEpisodesScheduleItemsResource,
     ProductionSequencesScheduleItemsResource,
     ProductionTimeSpentsResource,
@@ -55,7 +60,7 @@ routes = [
     ("/data/projects/<project_id>/day-offs", ProductionDayOffsResource),
     (
         "/data/projects/<project_id>/team/<person_id>",
-        ProductionTeamRemoveResource,
+        ProductionTeamMemberResource,
     ),
     (
         "/data/projects/<project_id>/settings/asset-types",
@@ -82,6 +87,10 @@ routes = [
         ProductionTaskStatusRemoveResource,
     ),
     (
+        "/data/projects/<project_id>/settings/batch",
+        ProductionSettingsBatchResource,
+    ),
+    (
         "/data/projects/<project_id>/settings/status-automations",
         ProductionStatusAutomationResource,
     ),
@@ -106,8 +115,20 @@ routes = [
         ProductionMetadataDescriptorsReorderResource,
     ),
     (
-        "/data/projects/<project_id>/metadata-descriptors/<descriptor_id>",
+        "/data/projects/<project_id>/metadata-descriptors/<metadata_descriptor_id>",
         ProductionMetadataDescriptorResource,
+    ),
+    (
+        "/data/metadata-descriptors/all-projects",
+        AllProjectsMetadataDescriptorsResource,
+    ),
+    (
+        "/actions/metadata-descriptors/all-projects/reorder",
+        AllProjectsMetadataDescriptorsReorderResource,
+    ),
+    (
+        "/data/metadata-descriptors/all-projects/<field_name>",
+        AllProjectsMetadataDescriptorResource,
     ),
     ("/data/projects/<project_id>/milestones", ProductionMilestonesResource),
     (
@@ -121,6 +142,10 @@ routes = [
     (
         "/data/projects/<project_id>/schedule-items/<task_type_id>/asset-types",
         ProductionAssetTypesScheduleItemsResource,
+    ),
+    (
+        "/data/projects/<project_id>/schedule-items/<task_type_id>/edits",
+        ProductionEditsScheduleItemsResource,
     ),
     (
         "/data/projects/<project_id>/schedule-items/<task_type_id>/episodes",

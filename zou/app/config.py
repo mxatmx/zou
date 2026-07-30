@@ -1,8 +1,10 @@
 import os
+import sys
 import datetime
 import tempfile
 
-from zou.app.utils import dbhelpers
+from sqlalchemy.engine.url import URL
+
 from zou.app.utils.env import envtobool, env_with_semicolon_to_list
 
 PROPAGATE_EXCEPTIONS = True
@@ -13,6 +15,31 @@ DEBUG_PORT = int(os.getenv("DEBUG_PORT", 5000))
 APP_NAME = "Zou"
 APP_SYSTEM_ERROR_SUBJECT_LINE = f"{APP_NAME} system error"
 SECRET_KEY = os.getenv("SECRET_KEY", "mysecretkey")
+# The default key is public: since JWT signing falls back to SECRET_KEY, an
+# unconfigured production deployment lets anyone forge admin tokens. Refuse to
+# boot the HTTP server with the default outside DEBUG. CLI commands and test
+# runs (pytest) never serve tokens, so they stay exempt and keep working
+# without the variable set. The CLI reaches us three ways: the `zou` console
+# script imports zou.cli (so it lands in sys.modules), while `python zou/cli.py`
+# and `python -m zou.cli` run cli.py as __main__ under that name instead, so we
+# also match on the __main__ module's file being cli.py.
+_main_module = sys.modules.get("__main__")
+_started_from_cli = (
+    "zou.cli" in sys.modules
+    or os.path.basename(getattr(_main_module, "__file__", "") or "")
+    == "cli.py"
+)
+if (
+    SECRET_KEY == "mysecretkey"
+    and not DEBUG
+    and "pytest" not in sys.modules
+    and not _started_from_cli
+):
+    raise RuntimeError(
+        "SECRET_KEY is set to the insecure default 'mysecretkey'. Set the "
+        "SECRET_KEY environment variable to a strong, unique value before "
+        "starting Zou in production."
+    )
 
 AUTH_STRATEGY = os.getenv("AUTH_STRATEGY", "auth_local_classic")
 BCRYPT_LOG_ROUNDS = int(os.getenv("BCRYPT_LOG_ROUNDS", 12))
@@ -52,7 +79,9 @@ DATABASE = {
     "password": os.getenv("DB_PASSWORD", "mysecretpassword"),
     "database": os.getenv("DB_DATABASE", "zoudb"),
 }
-SQLALCHEMY_DATABASE_URI = dbhelpers.get_db_uri()
+SQLALCHEMY_DATABASE_URI = URL.create(**DATABASE).render_as_string(
+    hide_password=False
+)
 SQLALCHEMY_TRACK_MODIFICATIONS = False
 SQLALCHEMY_ENGINE_OPTIONS = {
     "pool_size": int(os.getenv("DB_POOL_SIZE", 30)),
@@ -80,6 +109,11 @@ PREVIEW_FOLDER = os.getenv(
     os.getenv("THUMBNAIL_FOLDER", os.path.join(os.getcwd(), "previews")),
 )
 PREVIEW_SAVE_SOURCE_FILE = envtobool("PREVIEW_SAVE_SOURCE_FILE", False)
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", 20000 * 20000))
+# Cap on any request body size (Flask MAX_CONTENT_LENGTH). Generous by
+# default so multi-GB movie uploads keep working while unbounded bodies
+# can no longer fill the disk. Set to 0 to disable the limit.
+MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", 10 * 1024**3)) or None
 TMP_DIR = os.getenv("TMP_DIR", os.path.join(tempfile.gettempdir(), "zou"))
 
 EVENT_STREAM_HOST = os.getenv("EVENT_STREAM_HOST", "localhost")
@@ -123,6 +157,11 @@ FS_SWIFT_AES256_KEY = os.getenv("FS_SWIFT_AES256_KEY")
 FS_SWIFT_POOL_SIZE = int(os.getenv("FS_SWIFT_POOL_SIZE", 20))
 FS_SWIFT_TIMEOUT = int(os.getenv("FS_SWIFT_TIMEOUT", 60))
 FS_SWIFT_RETRIES = int(os.getenv("FS_SWIFT_RETRIES", 5))
+# What to do when the ETag returned by Swift does not match the uploaded
+# content: "log", "raise" or "raise_and_delete" (see flask-fs2 SwiftBackend).
+FS_SWIFT_ETAG_MISMATCH_POLICY = os.getenv(
+    "FS_SWIFT_ETAG_MISMATCH_POLICY", "log"
+)
 FS_S3_REGION = os.getenv("FS_S3_REGION")
 FS_S3_ENDPOINT = os.getenv("FS_S3_ENDPOINT")
 FS_S3_ACCESS_KEY = os.getenv("FS_S3_ACCESS_KEY")
@@ -153,6 +192,7 @@ LDAP_SSL = envtobool("LDAP_SSL", False)
 SAML_ENABLED = envtobool("SAML_ENABLED", False)
 SAML_IDP_NAME = os.getenv("SAML_IDP_NAME", "")
 SAML_METADATA_URL = os.getenv("SAML_METADATA_URL", "")
+SAML_SKIP_2FA = envtobool("SAML_SKIP_2FA", False)
 
 OIDC_ENABLED = envtobool("OIDC_ENABLED", False)
 OIDC_IDP_NAME = os.getenv("OIDC_IDP_NAME", "")
@@ -213,7 +253,8 @@ TELEMETRY_URL = os.getenv(
 
 REMOVE_FILES = envtobool("REMOVE_FILES", False)
 
-# Deprecated
+# Legacy defaults, still read by tasks_service, files_service and the
+# Shotgun importer; kept for backwards compatibility.
 TO_REVIEW_TASK_STATUS = "To review"
 DEFAULT_FILE_STATUS = "To review"
 DEFAULT_FILE_TREE = os.getenv("DEFAULT_FILE_TREE", "default")

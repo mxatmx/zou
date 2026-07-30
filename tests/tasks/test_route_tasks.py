@@ -279,6 +279,53 @@ class TaskRoutesTestCase(ApiDBTestCase):
         task = tasks_service.get_task(shot_task_id, relations=True)
         self.assertEqual(len(task["assignees"]), 0)
 
+    def test_update_task_assignees(self):
+        # The fixture task starts assigned to self.person.
+        self.generate_fixture_task()
+        task_id = str(self.task.id)
+        person_id = str(self.person.id)
+        self.put(f"data/tasks/{task_id}", {"assignees": []}, 200)
+        task = tasks_service.get_task(task_id, relations=True)
+        self.assertEqual(task["assignees"], [])
+        self.put(f"data/tasks/{task_id}", {"assignees": [person_id]}, 200)
+        task = tasks_service.get_task(task_id, relations=True)
+        self.assertEqual(task["assignees"], [person_id])
+        # The generic update emits the same task:assign event as the assign
+        # route, so the assignation notification is created too.
+        notifications = notifications_service.get_last_notifications(
+            "assignation"
+        )
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(str(notifications[0]["person_id"]), person_id)
+
+    def test_set_tasks_priority(self):
+        self.generate_fixture_task()
+        self.generate_fixture_shot_task()
+        task_id = str(self.task.id)
+        shot_task_id = str(self.shot_task.id)
+        data = {"task_ids": [task_id, shot_task_id], "priority": 2}
+        result = self.put("/actions/tasks/set-priority", data)
+
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all(task["priority"] == 2 for task in result))
+        task = tasks_service.get_task(task_id)
+        self.assertEqual(task["priority"], 2)
+        task = tasks_service.get_task(shot_task_id)
+        self.assertEqual(task["priority"], 2)
+
+    def test_set_tasks_priority_skips_forbidden_tasks(self):
+        self.generate_fixture_task()
+        self.generate_fixture_user_cg_artist()
+        task_id = str(self.task.id)
+        data = {"task_ids": [task_id], "priority": 1}
+        self.log_in_cg_artist()
+        result = self.put("/actions/tasks/set-priority", data)
+
+        self.assertEqual(result, [])
+        self.log_in_admin()
+        task = tasks_service.get_task(task_id)
+        self.assertEqual(task["priority"], 0)
+
     def test_comment_task(self):
         self.project_id = self.project.id
         self.generate_fixture_user_manager()
@@ -633,6 +680,61 @@ class TaskRoutesTestCase(ApiDBTestCase):
         )
         self.assertEqual(ProjectTaskTypeLink.query.count(), 1)
         self.assertEqual(ProjectTaskTypeLink.query.first().priority, 3)
+
+    def test_reorder_task_type_links(self):
+        project_id = str(self.project.id)
+        tt1 = str(self.task_type.id)
+        tt2 = str(self.task_type_concept.id)
+        projects_service.create_project_task_type_link(project_id, tt1, 1)
+        projects_service.create_project_task_type_link(project_id, tt2, 2)
+        result = self.post(
+            f"/actions/projects/{project_id}/task-type-links/reorder",
+            {"task_type_ids": [tt2, tt1]},
+            200,
+        )
+        by_type = {link["task_type_id"]: link["priority"] for link in result}
+        self.assertEqual(by_type[tt2], 1)
+        self.assertEqual(by_type[tt1], 2)
+
+    def test_reorder_task_types(self):
+        tt1 = str(self.task_type.id)
+        tt2 = str(self.task_type_concept.id)
+        result = self.post(
+            "/actions/task-types/reorder",
+            {"task_type_ids": [tt2, tt1]},
+            200,
+        )
+        by_type = {
+            task_type["id"]: task_type["priority"] for task_type in result
+        }
+        self.assertEqual(by_type[tt2], 1)
+        self.assertEqual(by_type[tt1], 2)
+
+    def test_reorder_task_status_links_preserves_roles(self):
+        from zou.app.models.project import ProjectTaskStatusLink
+
+        project_id = str(self.project.id)
+        ts1 = str(self.task_status_wip.id)
+        ts2 = str(self.task_status_done.id)
+        ProjectTaskStatusLink.create(
+            project_id=project_id,
+            task_status_id=ts1,
+            priority=1,
+            roles_for_board=["manager"],
+        )
+        ProjectTaskStatusLink.create(
+            project_id=project_id, task_status_id=ts2, priority=2
+        )
+        result = self.post(
+            f"/actions/projects/{project_id}/task-status-links/reorder",
+            {"task_status_ids": [ts2, ts1]},
+            200,
+        )
+        by_status = {link["task_status_id"]: link for link in result}
+        self.assertEqual(by_status[ts2]["priority"], 1)
+        self.assertEqual(by_status[ts1]["priority"], 2)
+        # The reorder only updates priority, board roles are preserved.
+        self.assertEqual(by_status[ts1]["roles_for_board"], ["manager"])
 
     def test_update_entity_main_preview_from_task(self):
         task = self.generate_fixture_task().serialize()

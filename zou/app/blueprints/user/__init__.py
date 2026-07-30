@@ -39,6 +39,8 @@ from zou.app.blueprints.user.resources import (
     HasTaskSubscribedResource,
     TaskSubscribeResource,
     TaskUnsubscribeResource,
+    TasksSubscribeResource,
+    TasksUnsubscribeResource,
     TaskTimeSpentResource,
     TimeSpentsResource,
     HasSequenceSubscribedResource,
@@ -90,9 +92,18 @@ routes = [
     ("/data/user/tasks/<task_id>/subscribed", HasTaskSubscribedResource),
     ("/data/user/chats", ChatsResource),
     ("/actions/user/chats/<entity_id>/join", JoinChatResource),
+    ("/actions/user/tasks/subscribe", TasksSubscribeResource),
+    ("/actions/user/tasks/unsubscribe", TasksUnsubscribeResource),
     ("/actions/user/tasks/<task_id>/subscribe", TaskSubscribeResource),
     ("/actions/user/tasks/<task_id>/unsubscribe", TaskUnsubscribeResource),
     ("/actions/user/clear-avatar", ClearAvatarResource),
+    (
+        "/data/user/sequences/<sequence_id>/task-types/<task_type_id>/"
+        "subscribed",
+        HasSequenceSubscribedResource,
+    ),
+    # Deprecated alias: the resource is sequence-specific, the entities
+    # segment was misleading.
     (
         "/data/user/entities/<sequence_id>/task-types/<task_type_id>/subscribed",
         HasSequenceSubscribedResource,

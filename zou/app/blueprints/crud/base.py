@@ -1,10 +1,35 @@
+"""
+Generic CRUD resources shared by every model exposed under /data.
+
+BaseModelsResource handles the collection (GET list, POST create) and
+BaseModelResource the single instance (GET, PUT, DELETE). Per-model
+subclasses in this package customize behaviour through overridable hooks
+rather than by reimplementing the HTTP methods:
+
+- check_read_permissions / check_create_permissions(data) /
+  check_update_permissions(instance, data) / check_delete_permissions
+  (instance): raise permissions.PermissionDenied to forbid; the default
+  requires admin.
+- add_project_permission_filter(query): narrow a list query to the
+  projects the caller may see.
+- update_data(data[, instance_id]): last chance to clean or complete the
+  payload before it hits the model (protected fields are already
+  stripped and dates validated).
+- pre/post_create, pre/post_update, pre/post_delete: side effects around
+  the mutation (events are emitted by emit_*_event).
+
+Hooks run inside the request; raising a domain exception maps to the
+matching error handler. Integrity/statement errors are caught here and
+returned as sanitized 400s (see build_db_error_message).
+"""
+
 import datetime
 import math
 import orjson as json
 import sqlalchemy.orm as orm
 
-from flask import request, abort, current_app
-from flask_restful import Resource
+from flask import request, current_app
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from sqlalchemy.exc import IntegrityError, StatementError
@@ -18,9 +43,29 @@ from zou.app.services.exception import (
 )
 
 
-class BaseModelsResource(Resource, ArgsMixin):
+def build_db_error_message(exception):
+    """
+    Client-safe message for database errors: the raw exception text embeds
+    SQL statements and bound parameter values, which must stay in the
+    server logs and never reach the client.
+    """
+    if isinstance(exception, IntegrityError):
+        origin = str(getattr(exception, "orig", exception)).lower()
+        if "duplicate key" in origin or "unique constraint" in origin:
+            return "A record with the same unique values already exists."
+        if "foreign key" in origin:
+            return "The change conflicts with records referencing this one."
+        if "not-null" in origin or "null value" in origin:
+            return "A required field is missing."
+        return "The data conflicts with database integrity rules."
+    if isinstance(exception, StatementError):
+        return "One of the provided values has an invalid format."
+    return str(exception)
+
+
+class BaseModelsResource(MethodView, ArgsMixin):
     def __init__(self, model):
-        Resource.__init__(self)
+        MethodView.__init__(self)
         self.model = model
         self.protected_fields = ["id", "created_at", "updated_at"]
 
@@ -63,7 +108,7 @@ class BaseModelsResource(Resource, ArgsMixin):
         if (total < offset) or (page < 1):
             result = {
                 "data": [],
-                "total": 0,
+                "total": total,
                 "nb_pages": nb_pages,
                 "limit": limit,
                 "offset": offset,
@@ -88,7 +133,10 @@ class BaseModelsResource(Resource, ArgsMixin):
 
         column_names = inspect(self.model).all_orm_descriptors.keys()
         for key, value in options.items():
-            if key not in ["page", "relations"] and key in column_names:
+            if (
+                key not in ["page", "relations", "fields"]
+                and key in column_names
+            ):
                 field_key = getattr(self.model, key)
 
                 is_many_to_many_field = hasattr(
@@ -109,7 +157,12 @@ class BaseModelsResource(Resource, ArgsMixin):
                     many_join_filter.append((key, value))
 
                 elif value_is_list:
-                    value_array = json.loads(value)
+                    try:
+                        value_array = json.loads(value)
+                    except ValueError:
+                        raise WrongParameterException(
+                            f"Malformed list filter for field {key}."
+                        )
                     in_filter.append(
                         field_key.in_(
                             [
@@ -163,7 +216,7 @@ class BaseModelsResource(Resource, ArgsMixin):
         return data
 
     def post_creation(self, instance):
-        return instance.serialize()
+        return instance.serialize(relations=True)
 
     @jwt_required()
     def get(self):
@@ -197,6 +250,15 @@ class BaseModelsResource(Resource, ArgsMixin):
             default: false
             example: false
             description: Whether to include relations
+          - in: query
+            name: fields
+            required: false
+            schema:
+              type: string
+            example: first_name,last_name
+            description: Comma-separated list of attributes to return for
+              each entry (id and type are always included). Unknown names
+              are ignored.
         responses:
             200:
               description: Models retrieved successfully
@@ -243,17 +305,30 @@ class BaseModelsResource(Resource, ArgsMixin):
                 self.check_read_permissions(options)
                 query = self.apply_filters(query, options)
                 query = self.add_project_permission_filter(query)
-                page = int(options.get("page", "-1"))
-                limit = int(options.get("limit", 0))
+                page = self.get_page()
+                limit = self.get_limit()
                 relations = self.get_bool_parameter("relations")
+                field_names = self.get_text_parameter("fields")
+                if field_names:
+                    field_names = [
+                        name.strip() for name in field_names.split(",")
+                    ]
                 is_paginated = page > -1
 
                 if is_paginated:
-                    return self.paginated_entries(
+                    result = self.paginated_entries(
                         query, page, limit=limit, relations=relations
                     )
+                    if field_names:
+                        result["data"] = fields.pick_fields(
+                            result["data"], field_names
+                        )
+                    return result
                 else:
-                    return self.all_entries(query, relations=relations)
+                    result = self.all_entries(query, relations=relations)
+                    if field_names:
+                        result = fields.pick_fields(result, field_names)
+                    return result
         except StatementError as exception:
             if hasattr(exception, "message"):
                 return (
@@ -336,7 +411,7 @@ class BaseModelsResource(Resource, ArgsMixin):
             KeyError,
         ) as exception:
             current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
+            return {"message": build_db_error_message(exception)}, 400
 
     def emit_create_event(self, instance_dict):
         return events.emit(
@@ -346,9 +421,9 @@ class BaseModelsResource(Resource, ArgsMixin):
         )
 
 
-class BaseModelResource(Resource, ArgsMixin):
+class BaseModelResource(MethodView, ArgsMixin):
     def __init__(self, model):
-        Resource.__init__(self)
+        MethodView.__init__(self)
         self.protected_fields = ["id", "created_at", "updated_at"]
         self.model = model
         self.instance = None
@@ -402,23 +477,24 @@ class BaseModelResource(Resource, ArgsMixin):
         }
         for key, value in data.items():
             if key in columns and isinstance(value, str) and value != "":
-                for fmt in (
-                    "%Y-%m-%dT%H:%M:%S.%f",
-                    "%Y-%m-%dT%H:%M:%S",
-                    "%Y-%m-%d",
-                ):
-                    try:
-                        datetime.datetime.strptime(value, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
+                try:
+                    # fromisoformat accepts what PostgreSQL does for ISO
+                    # 8601 (date only, time offsets...); Z must be mapped
+                    # to +00:00 while Python 3.10 is supported.
+                    datetime.datetime.fromisoformat(
+                        value.replace("Z", "+00:00")
+                    )
+                except ValueError:
                     raise WrongParameterException(
-                        f"Invalid date format for '{key}': '{value}'. Expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS."
+                        f"Invalid date format for '{key}': '{value}'. "
+                        "Expected an ISO 8601 date or datetime."
                     )
 
     def serialize_instance(self, data, relations=True):
         return data.serialize(relations=relations)
+
+    def serialize_update_response(self, instance):
+        return instance.serialize()
 
     def clean_get_result(self, data):
         return data
@@ -570,7 +646,7 @@ class BaseModelResource(Resource, ArgsMixin):
             self.pre_update(instance_dict, data)
             data = self.update_data(data, instance_id)
             self.instance.update(data)
-            instance_dict = self.instance.serialize()
+            instance_dict = self.serialize_update_response(self.instance)
             self.post_update(instance_dict, data)
             self.emit_update_event(instance_dict)
             return instance_dict, 200
@@ -581,7 +657,7 @@ class BaseModelResource(Resource, ArgsMixin):
             StatementError,
         ) as exception:
             current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
+            return {"message": build_db_error_message(exception)}, 400
 
     @jwt_required()
     def delete(self, instance_id):
@@ -616,13 +692,9 @@ class BaseModelResource(Resource, ArgsMixin):
             self.emit_delete_event(instance_dict)
             self.post_delete(instance_dict)
 
-        except IntegrityError as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
-
-        except StatementError as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
+        except (IntegrityError, StatementError) as exception:
+            current_app.logger.warning(str(exception), exc_info=1)
+            return {"message": build_db_error_message(exception)}, 400
 
         return "", 204
 

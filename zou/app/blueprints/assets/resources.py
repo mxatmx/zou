@@ -1,5 +1,7 @@
-from flask import request
-from flask_restful import Resource
+import orjson
+
+from flask import request, Response
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app.utils import permissions, query, validation
@@ -32,7 +34,7 @@ def check_criterion_access(criterions):
     return True
 
 
-class AssetResource(Resource, ArgsMixin):
+class AssetResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, asset_id):
@@ -131,7 +133,7 @@ class AssetResource(Resource, ArgsMixin):
         return "", 204
 
 
-class AllAssetsResource(Resource):
+class AllAssetsResource(MethodView):
 
     @jwt_required()
     def get(self):
@@ -210,7 +212,7 @@ class AllAssetsResource(Resource):
             ]
         return assets_service.get_assets(
             criterions,
-            is_admin=permissions.has_admin_permissions(),
+            only_user_projects=not permissions.has_admin_permissions(),
         )
 
 
@@ -218,7 +220,7 @@ class AllAssetsAliasResource(AllAssetsResource):
     pass
 
 
-class AssetsAndTasksResource(Resource, ArgsMixin):
+class AssetsAndTasksResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self):
@@ -241,6 +243,21 @@ class AssetsAndTasksResource(Resource, ArgsMixin):
             format: uuid
             description: Filter assets by episode (returns assets not linked to episode and assets linked to given episode)
             example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: compact
+            type: boolean
+            default: false
+            description: Encode assets and tasks as positional value arrays
+              (halves the payload). Field names are given by the
+              asset_fields and task_fields entries of the response, map
+              values by name, never by hardcoded position.
+          - in: query
+            name: stream
+            type: boolean
+            default: false
+            description: Stream the response as NDJSON (one header line,
+              then one asset per line) instead of a single JSON document,
+              to keep server memory flat on large productions.
           - in: query
             name: asset_type_id
             type: string
@@ -291,6 +308,13 @@ class AssetsAndTasksResource(Resource, ArgsMixin):
                         description: Array of related tasks
         """
         criterions = query.get_query_criterions_from_request(request)
+        # Kitsu-oriented options for full-project views: compact halves
+        # the payload (positional rows, field names in the header) and
+        # stream sends NDJSON without holding the response in memory.
+        # They are response options, not filters: pop them before the
+        # criterions reach the service.
+        stream = criterions.pop("stream", "false") == "true"
+        compact = criterions.pop("compact", "false") == "true"
         query.check_criterion_id_format(criterions)
         check_criterion_access(criterions)
         if permissions.has_vendor_permissions():
@@ -301,10 +325,37 @@ class AssetsAndTasksResource(Resource, ArgsMixin):
                 str(department.id)
                 for department in persons_service.get_current_user_raw().departments
             ]
-        return assets_service.get_assets_and_tasks(criterions)
+        only_user_projects = not permissions.has_admin_permissions()
+        if not stream and not compact:
+            return assets_service.get_assets_and_tasks(
+                criterions, only_user_projects=only_user_projects
+            )
+
+        rows = assets_service.prepare_assets_and_tasks(
+            criterions,
+            compact=compact,
+            only_user_projects=only_user_projects,
+        )
+        header = {"compact": compact}
+        if compact:
+            header["asset_fields"] = (
+                assets_service.ASSETS_AND_TASKS_ASSET_FIELDS
+            )
+            header["task_fields"] = assets_service.ASSETS_AND_TASKS_TASK_FIELDS
+
+        if not stream:
+            header["rows"] = list(rows)
+            return header
+
+        def generate():
+            yield orjson.dumps(header) + b"\n"
+            for item in rows:
+                yield orjson.dumps(item) + b"\n"
+
+        return Response(generate(), mimetype="application/x-ndjson")
 
 
-class AssetTypeResource(Resource):
+class AssetTypeResource(MethodView):
 
     @jwt_required()
     def get(self, asset_type_id):
@@ -353,7 +404,7 @@ class AssetTypeResource(Resource):
         return assets_service.get_asset_type(asset_type_id)
 
 
-class AssetTypesResource(Resource):
+class AssetTypesResource(MethodView):
 
     @jwt_required()
     def get(self):
@@ -404,7 +455,7 @@ class AssetTypesResource(Resource):
         return assets_service.get_asset_types(criterions)
 
 
-class ProjectAssetTypesResource(Resource):
+class ProjectAssetTypesResource(MethodView):
 
     @jwt_required()
     def get(self, project_id):
@@ -451,7 +502,7 @@ class ProjectAssetTypesResource(Resource):
         return assets_service.get_asset_types_for_project(project_id)
 
 
-class ShotAssetTypesResource(Resource):
+class ShotAssetTypesResource(MethodView):
 
     @jwt_required()
     def get(self, shot_id):
@@ -499,7 +550,7 @@ class ShotAssetTypesResource(Resource):
         return assets_service.get_asset_types_for_shot(shot_id)
 
 
-class ProjectAssetsResource(Resource):
+class ProjectAssetsResource(MethodView):
 
     @jwt_required()
     def get(self, project_id):
@@ -581,7 +632,7 @@ class ProjectAssetsResource(Resource):
         return assets_service.get_assets(criterions)
 
 
-class ProjectAssetTypeAssetsResource(Resource):
+class ProjectAssetTypeAssetsResource(MethodView):
 
     @jwt_required()
     def get(self, project_id, asset_type_id):
@@ -665,7 +716,7 @@ class ProjectAssetTypeAssetsResource(Resource):
         return assets_service.get_assets(criterions)
 
 
-class AssetAssetsResource(Resource):
+class AssetAssetsResource(MethodView):
 
     @jwt_required()
     def get(self, asset_id):
@@ -719,7 +770,7 @@ class AssetAssetsResource(Resource):
         return breakdown_service.get_entity_casting(asset_id)
 
 
-class AssetTasksResource(Resource, ArgsMixin):
+class AssetTasksResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, asset_id):
@@ -807,7 +858,7 @@ class AssetTasksResource(Resource, ArgsMixin):
         )
 
 
-class AssetTaskTypesResource(Resource):
+class AssetTaskTypesResource(MethodView):
 
     @jwt_required()
     def get(self, asset_id):
@@ -863,7 +914,7 @@ class AssetTaskTypesResource(Resource):
         return tasks_service.get_task_types_for_asset(asset_id)
 
 
-class NewAssetResource(Resource, ArgsMixin):
+class NewAssetResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, project_id, asset_type_id):
@@ -981,11 +1032,11 @@ class NewAssetResource(Resource, ArgsMixin):
             body.is_shared,
             str(body.episode_id) if body.episode_id else None,
             created_by=persons_service.get_current_user()["id"],
-            use_import_workflow=body.uses_import_workflow,
         )
         return asset, 201
 
-class AssetCastingResource(Resource):
+
+class AssetCastingResource(MethodView):
 
     @jwt_required()
     def get(self, asset_id):
@@ -1124,7 +1175,7 @@ class AssetCastingResource(Resource):
         return breakdown_service.update_casting(asset_id, casting)
 
 
-class AssetCastInResource(Resource):
+class AssetCastInResource(MethodView):
 
     @jwt_required()
     def get(self, asset_id):
@@ -1190,7 +1241,7 @@ class AssetCastInResource(Resource):
         return breakdown_service.get_cast_in(asset_id)
 
 
-class AssetShotAssetInstancesResource(Resource):
+class AssetShotAssetInstancesResource(MethodView):
 
     @jwt_required()
     def get(self, asset_id):
@@ -1247,7 +1298,7 @@ class AssetShotAssetInstancesResource(Resource):
         return breakdown_service.get_shot_asset_instances_for_asset(asset_id)
 
 
-class AssetSceneAssetInstancesResource(Resource):
+class AssetSceneAssetInstancesResource(MethodView):
     @jwt_required()
     def get(self, asset_id):
         """
@@ -1303,7 +1354,7 @@ class AssetSceneAssetInstancesResource(Resource):
         return breakdown_service.get_scene_asset_instances_for_asset(asset_id)
 
 
-class AssetAssetInstancesResource(Resource, ArgsMixin):
+class AssetAssetInstancesResource(MethodView, ArgsMixin):
     @jwt_required()
     def get(self, asset_id):
         """
@@ -1439,7 +1490,7 @@ class AssetAssetInstancesResource(Resource, ArgsMixin):
         return asset_instance, 201
 
 
-class BaseSetSharedAssetsResource(Resource, ArgsMixin):
+class BaseSetSharedAssetsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, project_id=None, asset_type_id=None, asset_ids=None):
@@ -1637,7 +1688,7 @@ class SetSharedAssetsResource(BaseSetSharedAssetsResource):
         return super().post(asset_ids=asset_ids)
 
 
-class ProjectAssetsSharedUsedResource(Resource):
+class ProjectAssetsSharedUsedResource(MethodView):
     @jwt_required()
     def get(self, project_id):
         """
@@ -1692,7 +1743,7 @@ class ProjectAssetsSharedUsedResource(Resource):
         return assets_service.get_shared_assets_used_in_project(project_id)
 
 
-class ProjectEpisodeAssetsSharedUsedResource(Resource):
+class ProjectEpisodeAssetsSharedUsedResource(MethodView):
 
     @jwt_required()
     def get(self, project_id, episode_id):

@@ -3,7 +3,12 @@ import unittest
 
 from tests.base import ApiDBTestCase
 from zou.app.models.department import Department
-from zou.app.models.person import Person, normalize_country
+from zou.app.models.person import (
+    Person,
+    SENSITIVE_FIELDS,
+    normalize_country,
+    normalize_locale,
+)
 
 from zou.app.utils import fields
 
@@ -27,6 +32,40 @@ class NormalizeCountryTestCase(unittest.TestCase):
     def test_malformed_values_are_rejected(self):
         for value in ["France", "FRA", "f", "f1", "éé", 123, ["FR"], 1.5]:
             self.assertEqual(normalize_country(value), (False, None))
+
+
+class NormalizeLocaleTestCase(unittest.TestCase):
+    """
+    Unit coverage for normalize_locale, the single source of truth shared by
+    the model validator and the API guard.
+    """
+
+    def test_valid_locales_are_trimmed_and_kept(self):
+        for value, expected in [
+            ("en_US", "en_US"),
+            ("fr_FR", "fr_FR"),
+            (" pt_BR ", "pt_BR"),
+            ("fr", "fr"),
+            ("en_us", "en_us"),  # Babel parses it back; casing is left as-is
+        ]:
+            self.assertEqual(normalize_locale(value), (True, expected))
+
+    def test_empty_values_mean_no_locale(self):
+        for value in [None, "", "   "]:
+            self.assertEqual(normalize_locale(value), (True, None))
+
+    def test_unparseable_values_are_rejected(self):
+        for value in [
+            "zz_ZZ",  # well-formed but unknown to Babel
+            "notlocale",
+            "en-US",  # wrong separator -> ValueError
+            "fr_FR_x",  # malformed identifier -> ValueError
+            "en_US_POSIX",  # valid Babel variant but too long for the column
+            123,
+            ["fr_FR"],
+            1.5,
+        ]:
+            self.assertEqual(normalize_locale(value), (False, None))
 
 
 class PersonTestCase(ApiDBTestCase):
@@ -157,6 +196,62 @@ class PersonTestCase(ApiDBTestCase):
         person = self.post("data/persons", data)
         self.assertIsNotNone(person["id"])
 
+    def test_update_bot_can_keep_email_shared_with_person(self):
+        data = {
+            "first_name": "Bot",
+            "last_name": "Bot",
+            "email": "ema.doe@gmail.com",
+            "is_bot": True,
+        }
+        bot = self.post("data/persons", data)
+
+        self.put(
+            f"data/persons/{bot['id']}",
+            {"first_name": "Renamed Bot", "email": bot["email"]},
+        )
+        bot_again = self.get(f"data/persons/{bot['id']}")
+        self.assertEqual(bot_again["first_name"], "Renamed Bot")
+        self.assertEqual(bot_again["email"], "ema.doe@gmail.com")
+
+    def test_update_expired_person_keeps_its_own_expiration_date(self):
+        import datetime
+
+        yesterday = datetime.date.today() - datetime.timedelta(days=2)
+        bot = Person.create(
+            first_name="Expired",
+            last_name="Bot",
+            email="expired.bot@gmail.com",
+            is_bot=True,
+            expiration_date=yesterday,
+        )
+        bot_id = str(bot.id)
+
+        # Re-submitting the already-expired date (e.g. to disable the bot)
+        # must work: it is unchanged, not a new past date.
+        self.put(
+            f"data/persons/{bot_id}",
+            {"expiration_date": yesterday.isoformat(), "active": False},
+        )
+        bot_again = self.get(f"data/persons/{bot_id}")
+        self.assertFalse(bot_again["active"])
+
+        # Moving the expiration to a different past date is still rejected.
+        other_past = (yesterday - datetime.timedelta(days=1)).isoformat()
+        self.put(
+            f"data/persons/{bot_id}",
+            {"expiration_date": other_past},
+            400,
+        )
+
+        # Renewing to a future date still works and issues a fresh token.
+        future = (
+            datetime.date.today() + datetime.timedelta(days=30)
+        ).isoformat()
+        renewed = self.put(
+            f"data/persons/{bot_id}", {"expiration_date": future}
+        )
+        self.assertIn("access_token", renewed)
+
     def test_update_person(self):
         person = self.get_first("data/persons")
         data = {
@@ -166,6 +261,42 @@ class PersonTestCase(ApiDBTestCase):
         person_again = self.get(f"data/persons/{person['id']}")
         self.assertEqual(data["first_name"], person_again["first_name"])
         self.put_404(f"data/persons/{fields.gen_uuid()}", data)
+
+    def test_write_routes_never_return_secrets(self):
+        person = self.get_first("data/persons")
+        Person.get(person["id"]).update(
+            {
+                "password": b"$2b$12$notarealbcrypthashbutlongenough",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "email_otp_secret": "KRSXG5CTMVRXEZLU",
+                "otp_recovery_codes": [b"$2b$12$notarealrecoverycodehash"],
+            }
+        )
+
+        updated = self.put(
+            f"data/persons/{person['id']}", {"last_name": "Doe"}
+        )
+        for field in SENSITIVE_FIELDS:
+            self.assertNotIn(field, updated)
+
+        created = self.post(
+            "data/persons",
+            {
+                "first_name": "No",
+                "last_name": "Secret",
+                "email": "no.secret@gmail.com",
+            },
+        )
+        for field in SENSITIVE_FIELDS:
+            self.assertNotIn(field, created)
+
+        self.generate_fixture_department()
+        joined = self.post(
+            f"actions/persons/{person['id']}/departments/add",
+            {"department_id": str(self.department.id)},
+        )
+        for field in SENSITIVE_FIELDS:
+            self.assertNotIn(field, joined)
 
     def test_person_country_round_trip(self):
         data = {
@@ -204,6 +335,38 @@ class PersonTestCase(ApiDBTestCase):
         self.put(f"data/persons/{person['id']}", {"country": ""})
         person_again = self.get(f"data/persons/{person['id']}")
         self.assertIsNone(person_again["country"])
+
+    def test_person_display_preferences_round_trip(self):
+        person = self.get_first("data/persons")
+        self.put(
+            f"data/persons/{person['id']}",
+            {"use_12_hour_clock": True, "display_date_format": "DD/MM/YYYY"},
+        )
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertTrue(person_again["use_12_hour_clock"])
+        self.assertEqual(person_again["display_date_format"], "DD/MM/YYYY")
+
+        self.put(f"data/persons/{person['id']}", {"display_date_format": None})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertIsNone(person_again["display_date_format"])
+
+    def test_person_invalid_display_date_format(self):
+        person = self.get_first("data/persons")
+        self.put(
+            f"data/persons/{person['id']}",
+            {"display_date_format": "DD-MM-YYYY"},
+            400,
+        )
+        self.post(
+            "data/persons",
+            {
+                "first_name": "Bad",
+                "last_name": "Format",
+                "email": "bad.format@gmail.com",
+                "display_date_format": "MM-DD",
+            },
+            400,
+        )
 
     def test_create_person_without_country(self):
         data = {
@@ -253,6 +416,76 @@ class PersonTestCase(ApiDBTestCase):
         self.assertNotIn("country", person.present_minimal())
         safe = person.serialize_safe()
         self.assertEqual(safe["country"], "FR")
+
+    def test_person_locale_round_trip(self):
+        data = {
+            "first_name": "Locale",
+            "last_name": "Tester",
+            "email": "locale.tester@gmail.com",
+            "locale": "fr_FR",
+        }
+        person = self.post("data/persons", data)
+        self.assertEqual(person["locale"], "fr_FR")
+
+        # The stored value survives every read path (single GET, relations,
+        # list) instead of breaking serialization.
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["locale"], "fr_FR")
+        person_with_relations = self.get(
+            f"data/persons/{person['id']}?relations=true"
+        )
+        self.assertEqual(person_with_relations["locale"], "fr_FR")
+        listed = next(
+            p for p in self.get("data/persons") if p["id"] == person["id"]
+        )
+        self.assertEqual(listed["locale"], "fr_FR")
+
+        self.put(f"data/persons/{person['id']}", {"locale": "pt_BR"})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["locale"], "pt_BR")
+
+        # Whitespace is trimmed on update.
+        self.put(f"data/persons/{person['id']}", {"locale": " ja_JP "})
+        person_again = self.get(f"data/persons/{person['id']}")
+        self.assertEqual(person_again["locale"], "ja_JP")
+
+    def test_create_person_with_invalid_locale(self):
+        data = {
+            "first_name": "Bad",
+            "last_name": "Locale",
+            "email": "bad.locale@gmail.com",
+            "locale": "zz_ZZ",
+        }
+        self.post("data/persons", data, 400)
+
+    def test_update_person_with_invalid_locale(self):
+        # The PUT guard rejects every unparseable category with a clean 400
+        # (never a 500 and never a poisoned entry): unknown locales, wrong
+        # separators, malformed identifiers and non-string bodies.
+        person = self.get_first("data/persons")
+        for value in [
+            "zz_ZZ",
+            "notlocale",
+            "en-US",
+            "fr_FR_x",
+            123,
+            ["fr_FR"],
+        ]:
+            self.put(f"data/persons/{person['id']}", {"locale": value}, 400)
+
+    def test_locale_validator_never_raises_on_direct_write(self):
+        # Direct writes (SSO sign-in, imports, scripts) bypass the API guard,
+        # so the model validator must silently discard bad input instead of
+        # persisting a value that would break later reads.
+        person = Person.get_by(email="ema.doe@gmail.com")
+        person.update({"locale": "zz_ZZ"})
+        self.assertIsNone(person.locale)
+        person.update({"locale": ["fr_FR"]})
+        self.assertIsNone(person.locale)
+        person.update({"locale": "en-US"})
+        self.assertIsNone(person.locale)
+        person.update({"locale": " fr_FR "})
+        self.assertEqual(str(person.locale), "fr_FR")
 
     def test_update_person_with_duplicate_email(self):
         persons = sorted(self.get("data/persons"), key=itemgetter("email"))

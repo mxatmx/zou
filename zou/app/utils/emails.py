@@ -5,7 +5,7 @@ from io import StringIO
 from html.parser import HTMLParser
 from flask_mail import Message
 
-from zou.app import mail, app
+from zou.app import mail
 
 # Force quoted-printable encoding for utf-8 message bodies so that the
 # Python email module wraps lines at 76 chars. Without this, long HTML
@@ -26,6 +26,8 @@ def send_email(subject, html, recipient_email, body=None, locale=None):
     If locale is provided (e.g. "en_US", "fr_FR"), the Content-Language
     header is set so the recipient's client can use the correct language.
     """
+    from zou.app import app
+
     if body is None:
         body = strip_html_tags(html)
     if app.config["MAIL_DEBUG_BODY"]:
@@ -51,8 +53,15 @@ def send_email(subject, html, recipient_email, body=None, locale=None):
                         pass
                 mail.send(message)
             except Exception:
-                app.logger.info("Exception when sending a mail notification:")
-                app.logger.info(traceback.format_exc())
+                # Log at error level so failures show up in production and
+                # RQ worker logs: the default Flask logger drops info
+                # messages, which made SMTP errors invisible while the
+                # email job was still reported as successful.
+                app.logger.error(
+                    f"Failed to send email to {recipient_email} "
+                    f"(subject: {subject}):"
+                )
+                app.logger.error(traceback.format_exc())
 
 
 class HTMLStripper(HTMLParser):

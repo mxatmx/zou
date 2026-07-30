@@ -1,6 +1,6 @@
-from flask import g, request
+from flask import current_app, g, request
 from flask_fs.errors import FileNotFound
-from flask_restful import Resource
+from flask.views import MethodView
 
 from zou.app.blueprints.previews.resources import (
     ALLOWED_FILE_EXTENSION,
@@ -34,7 +34,7 @@ from zou.app.services.exception import (
 from zou.app.utils import permissions, validation
 
 
-class SharedPlaylistResource(Resource):
+class SharedPlaylistResource(MethodView):
     @require_valid_playlist_share_link(with_password=True)
     def get(self, token):
         """
@@ -73,7 +73,7 @@ class SharedPlaylistResource(Resource):
         return playlist_sharing_service.enrich_shots_with_entity_info(playlist)
 
 
-class SharedPlaylistGuestResource(Resource):
+class SharedPlaylistGuestResource(MethodView):
     @require_valid_playlist_share_link()
     def post(self, token):
         """
@@ -140,7 +140,7 @@ class SharedPlaylistGuestResource(Resource):
         return guest, 201
 
 
-class SharedPlaylistCommentsResource(Resource):
+class SharedPlaylistCommentsResource(MethodView):
     @require_valid_playlist_share_link(with_password=True)
     def get(self, token):
         """
@@ -190,7 +190,9 @@ class SharedPlaylistCommentsResource(Resource):
                     playlist_sharing_service.get_shared_task_comments(task_id)
                 )
             except Exception:
-                pass
+                current_app.logger.exception(
+                    f"Failed to load shared comments for task {task_id}."
+                )
         return comments
 
     @require_valid_playlist_share_link(with_password=True)
@@ -307,7 +309,7 @@ class SharedPlaylistCommentsResource(Resource):
         return comment, 201
 
 
-class SharedPlaylistCommentResource(Resource):
+class SharedPlaylistCommentResource(MethodView):
     """
     Edit or delete a single comment authored by a guest.
     """
@@ -371,7 +373,7 @@ class SharedPlaylistCommentResource(Resource):
             return {"error": "Comment not found"}, 404
 
 
-class SharedPlaylistCommentAttachmentsResource(Resource):
+class SharedPlaylistCommentAttachmentsResource(MethodView):
     """
     Add an attachment file to a guest-owned comment.
     """
@@ -404,13 +406,13 @@ class SharedPlaylistCommentAttachmentsResource(Resource):
             return {"error": "Comment not found"}, 404
 
 
-class SharedPlaylistCommentAttachmentResource(Resource):
+class SharedPlaylistCommentAttachmentResource(MethodView):
     """
     Delete one attachment from a guest-owned comment.
     """
 
     @require_valid_playlist_share_link()
-    def delete(self, token, comment_id, attachment_id):
+    def delete(self, token, comment_id, attachment_file_id):
         """
         Delete an attachment from a guest-owned comment
         ---
@@ -424,7 +426,7 @@ class SharedPlaylistCommentAttachmentResource(Resource):
         body = validation.validate_request_body(GuestActionSchema)
         try:
             playlist_sharing_service.remove_guest_comment_attachment(
-                comment_id, str(body.guest_id), attachment_id, token
+                comment_id, str(body.guest_id), attachment_file_id, token
             )
             return "", 204
         except playlist_sharing_service.GuestCommentForbidden:
@@ -433,13 +435,13 @@ class SharedPlaylistCommentAttachmentResource(Resource):
             return {"error": "Comment not found"}, 404
 
 
-class SharedPlaylistAttachmentFileResource(Resource):
+class SharedPlaylistAttachmentFileResource(MethodView):
     """
     Download an attachment that belongs to a visible shared comment.
     """
 
     @require_valid_playlist_share_link()
-    def get(self, token, attachment_id, file_name):
+    def get(self, token, attachment_file_id, file_name):
         """
         Download attachment file
         ---
@@ -451,13 +453,13 @@ class SharedPlaylistAttachmentFileResource(Resource):
         """
         try:
             return playlist_sharing_service.download_shared_attachment(
-                token, attachment_id, file_name
+                token, attachment_file_id, file_name
             )
         except playlist_sharing_service.GuestCommentNotFound:
             return {"error": "Attachment not found"}, 404
 
 
-class SharedPlaylistAnnotationsResource(Resource):
+class SharedPlaylistAnnotationsResource(MethodView):
     @require_valid_playlist_share_link()
     def put(self, token):
         """
@@ -567,7 +569,7 @@ def _is_task_in_shared_playlist(token, task_id):
     return False
 
 
-class SharedPlaylistPreviewFileResource(Resource):
+class SharedPlaylistPreviewFileResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -608,7 +610,7 @@ class SharedPlaylistPreviewFileResource(Resource):
         return files_service.get_preview_file(preview_file_id)
 
 
-class SharedPlaylistPreviewFileMovieResource(Resource):
+class SharedPlaylistPreviewFileMovieResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -663,7 +665,7 @@ class SharedPlaylistPreviewFileMovieResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistPreviewFileThumbnailResource(Resource):
+class SharedPlaylistPreviewFileThumbnailResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -717,7 +719,7 @@ class SharedPlaylistPreviewFileThumbnailResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistPreviewFileOriginalResource(Resource):
+class SharedPlaylistPreviewFileOriginalResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -771,7 +773,7 @@ class SharedPlaylistPreviewFileOriginalResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistPreviewFileExtensionResource(Resource):
+class SharedPlaylistPreviewFileExtensionResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id, extension):
         """
@@ -849,7 +851,7 @@ class SharedPlaylistPreviewFileExtensionResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistPreviewFileTileResource(Resource):
+class SharedPlaylistPreviewFileTileResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -903,7 +905,7 @@ class SharedPlaylistPreviewFileTileResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistPreviewFileDownloadResource(Resource):
+class SharedPlaylistPreviewFileDownloadResource(MethodView):
     @require_valid_playlist_share_link()
     def get(self, token, preview_file_id):
         """
@@ -970,7 +972,7 @@ class SharedPlaylistPreviewFileDownloadResource(Resource):
             raise PreviewFileNotFoundException
 
 
-class SharedPlaylistContextResource(Resource):
+class SharedPlaylistContextResource(MethodView):
     @require_valid_playlist_share_link(with_password=True)
     def get(self, token):
         """

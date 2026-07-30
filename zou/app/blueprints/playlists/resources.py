@@ -7,13 +7,14 @@ from flask import (
     request,
     send_file as flask_send_file,
 )
-from flask_restful import Resource
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app import config
 from zou.app.mixin import ArgsMixin
 
 from zou.app.blueprints.playlists.schemas import (
+    AddEntitiesToPlaylistSchema,
     AddEntityToPlaylistSchema,
     CreatePlaylistShareLinkSchema,
     InviteShareLinkSchema,
@@ -41,7 +42,7 @@ from zou.app.utils import fs, permissions, validation
 from zou.utils.movie import EncodingParameters
 
 
-class ProjectPlaylistsResource(Resource, ArgsMixin):
+class ProjectPlaylistsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -122,7 +123,7 @@ class ProjectPlaylistsResource(Resource, ArgsMixin):
         )
 
 
-class EpisodePlaylistsResource(Resource, ArgsMixin):
+class EpisodePlaylistsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id, episode_id):
@@ -193,7 +194,7 @@ class EpisodePlaylistsResource(Resource, ArgsMixin):
         )
 
 
-class ProjectPlaylistResource(Resource):
+class ProjectPlaylistResource(MethodView):
 
     @jwt_required()
     def get(self, project_id, playlist_id):
@@ -259,7 +260,7 @@ class ProjectPlaylistResource(Resource):
         )
 
 
-class EntityPreviewsResource(Resource):
+class EntityPreviewsResource(MethodView):
 
     @jwt_required()
     def get(self, entity_id):
@@ -308,7 +309,7 @@ class EntityPreviewsResource(Resource):
         return playlists_service.get_preview_files_for_entity(entity_id)
 
 
-class PlaylistAddEntityResource(Resource, ArgsMixin):
+class PlaylistAddEntityResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, playlist_id):
@@ -364,7 +365,79 @@ class PlaylistAddEntityResource(Resource, ArgsMixin):
         return updated_playlist
 
 
-class PlaylistDownloadResource(Resource):
+class PlaylistAddEntitiesResource(MethodView, ArgsMixin):
+
+    @jwt_required()
+    def post(self, playlist_id):
+        """
+        Add entities to playlist
+        ---
+        description: Atomically add several (entity, preview) couples to the
+          given playlist in a single database write. A playlist entry is the
+          couple, so the same entity may be added several times with
+          different previews; only exact duplicate couples are skipped. When
+          a couple has no preview_file_id, the entity's latest preview
+          (highest revision, restricted to the playlist task type when one is
+          set) is used.
+        tags:
+          - Playlists
+        parameters:
+          - in: path
+            name: playlist_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Playlist unique identifier
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - entities
+                properties:
+                  entities:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - entity_id
+                      properties:
+                        entity_id:
+                          type: string
+                          format: uuid
+                        preview_file_id:
+                          type: string
+                          format: uuid
+                          nullable: true
+                    description: Entity/preview couples to add to the playlist
+        responses:
+          200:
+            description: Updated playlist
+            content:
+              application/json:
+                schema:
+                  type: object
+        """
+        playlist = playlists_service.get_playlist(playlist_id)
+        user_service.check_playlist_update_access(playlist)
+
+        body = validation.validate_request_body(AddEntitiesToPlaylistSchema)
+        entities = [
+            {
+                "entity_id": entity.entity_id,
+                "preview_file_id": entity.preview_file_id,
+            }
+            for entity in body.entities
+        ]
+        return playlists_service.add_entities_to_playlist(
+            playlist_id, entities
+        )
+
+
+class PlaylistDownloadResource(MethodView):
 
     @jwt_required()
     def get(self, playlist_id, build_job_id):
@@ -451,7 +524,7 @@ class PlaylistDownloadResource(Resource):
         )
 
 
-class BuildPlaylistMovieResource(Resource, ArgsMixin):
+class BuildPlaylistMovieResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, playlist_id):
@@ -560,7 +633,7 @@ class BuildPlaylistMovieResource(Resource, ArgsMixin):
             return job
 
 
-class PlaylistZipDownloadResource(Resource):
+class PlaylistZipDownloadResource(MethodView):
 
     @jwt_required()
     def get(self, playlist_id):
@@ -619,7 +692,7 @@ class PlaylistZipDownloadResource(Resource):
         )
 
 
-class BuildJobResource(Resource):
+class BuildJobResource(MethodView):
 
     @jwt_required()
     def get(self, playlist_id, build_job_id):
@@ -716,7 +789,7 @@ class BuildJobResource(Resource):
         return "", 204
 
 
-class ProjectBuildJobsResource(Resource):
+class ProjectBuildJobsResource(MethodView):
 
     @jwt_required()
     def get(self, project_id):
@@ -766,7 +839,7 @@ class ProjectBuildJobsResource(Resource):
         return playlists_service.get_build_jobs_for_project(project_id)
 
 
-class ProjectAllPlaylistsResource(Resource, ArgsMixin):
+class ProjectAllPlaylistsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -817,7 +890,7 @@ class ProjectAllPlaylistsResource(Resource, ArgsMixin):
         return playlists_service.get_playlists_for_project(project_id, page)
 
 
-class TempPlaylistResource(Resource, ArgsMixin):
+class TempPlaylistResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, project_id):
@@ -893,7 +966,7 @@ class TempPlaylistResource(Resource, ArgsMixin):
         )
 
 
-class NotifyClientsResource(Resource, ArgsMixin):
+class NotifyClientsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, playlist_id):
@@ -956,7 +1029,7 @@ class NotifyClientsResource(Resource, ArgsMixin):
         return {"status": "success"}
 
 
-class PlaylistShareLinksResource(Resource):
+class PlaylistShareLinksResource(MethodView):
     """
     Manage share links for a playlist (manager+).
     """
@@ -987,7 +1060,7 @@ class PlaylistShareLinksResource(Resource):
         return share_link, 201
 
 
-class PlaylistShareLinkResource(Resource):
+class PlaylistShareLinkResource(MethodView):
     """
     Revoke a specific share link (manager+).
     """
@@ -1008,7 +1081,7 @@ class PlaylistShareLinkResource(Resource):
         return playlist_sharing_service.revoke_share_link(token)
 
 
-class PlaylistShareLinkInviteResource(Resource):
+class PlaylistShareLinkInviteResource(MethodView):
     """
     Email a share link to one or more recipients (manager+).
 

@@ -1,8 +1,8 @@
 import datetime
 
 
-from flask import abort, request
-from flask_restful import Resource, inputs
+from flask import request
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app.services.exception import (
@@ -29,10 +29,19 @@ from zou.app.services import (
     user_service,
     concepts_service,
 )
-from zou.app.utils import events, query, permissions, date_helpers, validation
+from zou.app.utils import (
+    events,
+    query,
+    permissions,
+    date_helpers,
+    validation,
+    fields,
+)
 from zou.app.mixin import ArgsMixin
 from zou.app.blueprints.tasks.schemas import (
     CommentPreviewSchema,
+    SetTasksMainPreviewSchema,
+    SetTasksPrioritySchema,
     ToReviewSchema,
     UnassignTasksSchema,
     AssignTasksSchema,
@@ -41,7 +50,7 @@ from zou.app.blueprints.tasks.schemas import (
 )
 
 
-class AddPreviewResource(Resource, ArgsMixin):
+class AddPreviewResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, task_id, comment_id):
@@ -124,7 +133,7 @@ class AddPreviewResource(Resource, ArgsMixin):
         return preview_file, 201
 
 
-class AddExtraPreviewResource(Resource, ArgsMixin):
+class AddExtraPreviewResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, task_id, comment_id, preview_file_id):
@@ -262,7 +271,7 @@ class AddExtraPreviewResource(Resource, ArgsMixin):
         return "", 204
 
 
-class TaskPreviewsResource(Resource):
+class TaskPreviewsResource(MethodView):
 
     @jwt_required()
     def get(self, task_id):
@@ -318,7 +327,7 @@ class TaskPreviewsResource(Resource):
         return files_service.get_preview_files_for_task(task_id)
 
 
-class TaskCommentsResource(Resource):
+class TaskCommentsResource(MethodView):
 
     @jwt_required()
     def get(self, task_id):
@@ -379,7 +388,7 @@ class TaskCommentsResource(Resource):
         )
 
 
-class TaskCommentResource(Resource):
+class TaskCommentResource(MethodView):
 
     @jwt_required()
     def get(self, task_id, comment_id):
@@ -492,6 +501,7 @@ class TaskCommentResource(Resource):
         """
         comment = tasks_service.get_comment(comment_id)
         task = tasks_service.get_task(comment["object_id"])
+        user_service.resolve_project_role(task["project_id"])
         if permissions.has_manager_permissions():
             user_service.check_project_access(task["project_id"])
         else:
@@ -504,7 +514,7 @@ class TaskCommentResource(Resource):
         return "", 204
 
 
-class PersonTasksResource(Resource):
+class PersonTasksResource(MethodView):
 
     @jwt_required()
     def get(self, person_id):
@@ -583,7 +593,7 @@ class PersonTasksResource(Resource):
         return tasks_service.get_person_tasks(person_id, projects)
 
 
-class PersonRelatedTasksResource(Resource):
+class PersonRelatedTasksResource(MethodView):
 
     @jwt_required()
     def get(self, person_id, task_type_id):
@@ -659,7 +669,7 @@ class PersonRelatedTasksResource(Resource):
         return tasks_service.get_person_related_tasks(person_id, task_type_id)
 
 
-class PersonDoneTasksResource(Resource):
+class PersonDoneTasksResource(MethodView):
 
     @jwt_required()
     def get(self, person_id):
@@ -738,7 +748,7 @@ class PersonDoneTasksResource(Resource):
         return tasks_service.get_person_done_tasks(person_id, projects)
 
 
-class CreateShotTasksResource(Resource):
+class CreateShotTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id, task_type_id):
@@ -814,7 +824,7 @@ class CreateShotTasksResource(Resource):
         user_service.check_manager_project_access(project_id)
         task_type = tasks_service.get_task_type(task_type_id)
 
-        shot_ids = request.json
+        shot_ids = validation.validate_id_list(required=False)
         shots = []
         if isinstance(shot_ids, list) and len(shot_ids) > 0:
             for shot_id in shot_ids:
@@ -830,7 +840,7 @@ class CreateShotTasksResource(Resource):
         return tasks, 201
 
 
-class CreateConceptTasksResource(Resource):
+class CreateConceptTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id, task_type_id):
@@ -911,7 +921,7 @@ class CreateConceptTasksResource(Resource):
             raise permissions.PermissionDenied
         task_type = tasks_service.get_task_type(task_type_id)
 
-        concept_ids = request.json
+        concept_ids = validation.validate_id_list(required=False)
         concepts = []
         if isinstance(concept_ids, list) and len(concept_ids) > 0:
             for concept_id in concept_ids:
@@ -930,7 +940,7 @@ class CreateConceptTasksResource(Resource):
         return tasks, 201
 
 
-class CreateEntityTasksResource(Resource):
+class CreateEntityTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id, entity_type, task_type_id):
@@ -1018,7 +1028,7 @@ class CreateEntityTasksResource(Resource):
             )
         )
 
-        entity_ids = request.json
+        entity_ids = validation.validate_id_list(required=False)
         entities = []
         if isinstance(entity_ids, list) and len(entity_ids) > 0:
             for entity_id in entity_ids:
@@ -1036,7 +1046,7 @@ class CreateEntityTasksResource(Resource):
         return tasks, 201
 
 
-class CreateAssetTasksResource(Resource):
+class CreateAssetTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id, task_type_id):
@@ -1112,7 +1122,7 @@ class CreateAssetTasksResource(Resource):
         user_service.check_manager_project_access(project_id)
         task_type = tasks_service.get_task_type(task_type_id)
 
-        asset_ids = request.json
+        asset_ids = validation.validate_id_list(required=False)
         assets = []
         if isinstance(asset_ids, list) and len(asset_ids) > 0:
             for asset_id in asset_ids:
@@ -1128,7 +1138,7 @@ class CreateAssetTasksResource(Resource):
         return tasks, 201
 
 
-class CreateEditTasksResource(Resource):
+class CreateEditTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id, task_type_id):
@@ -1204,7 +1214,7 @@ class CreateEditTasksResource(Resource):
         user_service.check_manager_project_access(project_id)
         task_type = tasks_service.get_task_type(task_type_id)
 
-        edit_ids = request.json
+        edit_ids = validation.validate_id_list(required=False)
         edits = []
         if isinstance(edit_ids, list) and len(edit_ids) > 0:
             for edit_id in edit_ids:
@@ -1220,7 +1230,7 @@ class CreateEditTasksResource(Resource):
         return tasks, 201
 
 
-class ToReviewResource(Resource, ArgsMixin):
+class ToReviewResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def put(self, task_id):
@@ -1343,7 +1353,7 @@ class ToReviewResource(Resource, ArgsMixin):
         return {"folder_path": folder_path, "file_name": file_name}
 
 
-class ClearAssignationResource(Resource, ArgsMixin):
+class ClearAssignationResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def put(self):
@@ -1406,7 +1416,67 @@ class ClearAssignationResource(Resource, ArgsMixin):
         return tasks
 
 
-class TasksAssignResource(Resource, ArgsMixin):
+class SetTasksPriorityResource(MethodView, ArgsMixin):
+
+    @jwt_required()
+    def put(self):
+        """
+        Set tasks priority
+        ---
+        tags:
+        - Tasks
+        description: Set the priority of every task given in the id list.
+          Tasks the current user is not allowed to update are skipped.
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - task_ids
+                  - priority
+                properties:
+                  task_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                    example: [
+                      "a24a6ea4-ce75-4665-a070-57453082c25",
+                      "b24a6ea4-ce75-4665-a070-57453082c25"
+                    ]
+                  priority:
+                    type: integer
+                    example: 2
+        responses:
+            200:
+                description: Updated tasks
+                content:
+                  application/json:
+                    schema:
+                      type: array
+                      items:
+                        type: object
+        """
+        body = validation.validate_request_body(SetTasksPrioritySchema)
+
+        data = {"priority": body.priority}
+        tasks = []
+        for task_id in body.task_ids:
+            try:
+                task = tasks_service.get_task(task_id)
+                user_service.check_supervisor_task_access(task, data)
+                tasks.append(tasks_service.update_task(task_id, dict(data)))
+            except permissions.PermissionDenied:
+                pass
+            except TaskNotFoundException:
+                pass
+
+        return tasks
+
+
+class TasksAssignResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def put(self, person_id):
@@ -1513,7 +1583,7 @@ class TasksAssignResource(Resource, ArgsMixin):
         return tasks
 
 
-class TaskAssignResource(Resource, ArgsMixin):
+class TaskAssignResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def put(self, task_id):
@@ -1603,7 +1673,7 @@ class TaskAssignResource(Resource, ArgsMixin):
         return task
 
 
-class TaskFullResource(Resource):
+class TaskFullResource(MethodView):
 
     @jwt_required()
     def get(self, task_id):
@@ -1697,7 +1767,7 @@ class TaskFullResource(Resource):
         return task
 
 
-class TaskForEntityResource(Resource):
+class TaskForEntityResource(MethodView):
 
     @jwt_required()
     def get(self, entity_id, task_type_id):
@@ -1770,7 +1840,7 @@ class TaskForEntityResource(Resource):
         )
 
 
-class SetTimeSpentResource(Resource, ArgsMixin):
+class SetTimeSpentResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, task_id, date, person_id):
@@ -1940,7 +2010,7 @@ class SetTimeSpentResource(Resource, ArgsMixin):
             raise WrongParameterException("Wrong date format.")
 
 
-class AddTimeSpentResource(Resource, ArgsMixin):
+class AddTimeSpentResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, task_id, date, person_id):
@@ -2034,7 +2104,7 @@ class AddTimeSpentResource(Resource, ArgsMixin):
             raise WrongParameterException("Wrong date format.")
 
 
-class GetTimeSpentResource(Resource):
+class GetTimeSpentResource(MethodView):
 
     @jwt_required()
     def get(self, task_id):
@@ -2089,7 +2159,7 @@ class GetTimeSpentResource(Resource):
         return tasks_service.get_time_spents(task_id)
 
 
-class GetTimeSpentDateResource(Resource):
+class GetTimeSpentDateResource(MethodView):
 
     @jwt_required()
     def get(self, task_id, date):
@@ -2154,7 +2224,7 @@ class GetTimeSpentDateResource(Resource):
             raise WrongParameterException("Wrong date format.")
 
 
-class DeleteAllTasksForTaskTypeResource(Resource):
+class DeleteAllTasksForTaskTypeResource(MethodView):
 
     @jwt_required()
     def delete(self, project_id, task_type_id):
@@ -2194,7 +2264,7 @@ class DeleteAllTasksForTaskTypeResource(Resource):
         return "", 204
 
 
-class DeleteTasksResource(Resource):
+class DeleteTasksResource(MethodView):
 
     @jwt_required()
     def post(self, project_id):
@@ -2225,16 +2295,14 @@ class DeleteTasksResource(Resource):
                       example: ["a24a6ea4-ce75-4665-a070-57453082c25"]
         """
         user_service.check_manager_project_access(project_id)
-        task_ids = request.json
-        if not isinstance(task_ids, list):
-            raise WrongParameterException("Request body must be a JSON array.")
+        task_ids = validation.validate_id_list()
         task_ids = deletion_service.remove_tasks(project_id, task_ids)
         for task_id in task_ids:
             tasks_service.clear_task_cache(task_id)
         return task_ids, 200
 
 
-class ProjectSubscriptionsResource(Resource):
+class ProjectSubscriptionsResource(MethodView):
 
     @jwt_required()
     @permissions.require_admin
@@ -2285,7 +2353,7 @@ class ProjectSubscriptionsResource(Resource):
         return notifications_service.get_subscriptions_for_project(project_id)
 
 
-class ProjectNotificationsResource(Resource, ArgsMixin):
+class ProjectNotificationsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2362,7 +2430,7 @@ class ProjectNotificationsResource(Resource, ArgsMixin):
         )
 
 
-class ProjectTasksResource(Resource, ArgsMixin):
+class ProjectTasksResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -2459,7 +2527,7 @@ class ProjectTasksResource(Resource, ArgsMixin):
         )
 
 
-class ProjectCommentsResource(Resource, ArgsMixin):
+class ProjectCommentsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, project_id):
@@ -2529,7 +2597,7 @@ class ProjectCommentsResource(Resource, ArgsMixin):
         return tasks_service.get_comments_for_project(project_id, page, limit)
 
 
-class ProjectPreviewFilesResource(Resource, ArgsMixin):
+class ProjectPreviewFilesResource(MethodView, ArgsMixin):
 
     @jwt_required()
     @permissions.require_admin
@@ -2601,7 +2669,7 @@ class ProjectPreviewFilesResource(Resource, ArgsMixin):
         return files_service.get_preview_files_for_project(project_id, page)
 
 
-class SetTaskMainPreviewResource(Resource):
+class SetTaskMainPreviewResource(MethodView):
     @jwt_required()
     def put(self, task_id):
         """
@@ -2622,6 +2690,8 @@ class SetTaskMainPreviewResource(Resource):
         responses:
             200:
                 description: Preview set as main preview
+            400:
+                description: The task has no preview file
                 content:
                   application/json:
                     schema:
@@ -2658,21 +2728,83 @@ class SetTaskMainPreviewResource(Resource):
         task = tasks_service.get_task(task_id)
         user_service.check_project_access(task["project_id"])
         user_service.check_entity_access(task["entity_id"])
+        # Clients review content but must not redefine how an entity is
+        # illustrated.
+        if permissions.has_client_permissions():
+            raise permissions.PermissionDenied
         preview_file = preview_files_service.get_last_preview_file_for_task(
             task_id
         )
-        entity = None
-        if preview_file is not None:
-            entity = entities_service.update_entity_preview(
-                task["entity_id"], preview_file["id"]
+        if preview_file is None:
+            raise WrongParameterException(
+                "This task has no preview file to set as the main preview."
             )
-        return entity
+        return entities_service.update_entity_preview(
+            task["entity_id"], preview_file["id"]
+        )
 
 
-class PersonsTasksDatesResource(Resource, ArgsMixin):
+class SetTasksMainPreviewResource(MethodView):
+    @jwt_required()
+    def put(self):
+        """
+        Set main preview from several tasks
+        ---
+        tags:
+          - Tasks
+        description: For each task in the id list, set its last preview as
+          the main preview of the related entity. Useful to set thumbnails
+          for a selection in one request. Tasks without a preview are
+          skipped. Returns the updated entities.
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - task_ids
+                properties:
+                  task_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        responses:
+            200:
+                description: Entities whose main preview was updated
+                content:
+                  application/json:
+                    schema:
+                      type: array
+                      items:
+                        type: object
+        """
+        body = validation.validate_request_body(SetTasksMainPreviewSchema)
+        # Clients review content but must not redefine how an entity is
+        # illustrated.
+        if permissions.has_client_permissions():
+            raise permissions.PermissionDenied
+        entities = []
+        for task_id in body.task_ids:
+            task = tasks_service.get_task(task_id)
+            user_service.check_project_access(task["project_id"])
+            user_service.check_entity_access(task["entity_id"])
+            preview_file = (
+                preview_files_service.get_last_preview_file_for_task(task_id)
+            )
+            if preview_file is not None:
+                entities.append(
+                    entities_service.update_entity_preview(
+                        task["entity_id"], preview_file["id"]
+                    )
+                )
+        return entities
+
+
+class PersonsTasksDatesResource(MethodView, ArgsMixin):
 
     @jwt_required()
-    @permissions.require_admin
     def get(self):
         """
         Get persons tasks dates
@@ -2681,7 +2813,8 @@ class PersonsTasksDatesResource(Resource, ArgsMixin):
         - Tasks
         description: For each active person, return the first start date of all
           tasks assigned to them and the last end date. Useful for schedule
-          planning.
+          planning. Admins get the studio-wide view; managers are restricted to
+          the projects of their own teams.
         parameters:
           - in: query
             name: project_id
@@ -2706,23 +2839,38 @@ class PersonsTasksDatesResource(Resource, ArgsMixin):
                           type: string
                           format: uuid
                           example: a24a6ea4-ce75-4665-a070-57453082c25
-                        first_start_date:
+                        min_date:
                           type: string
-                          format: date
-                          example: "2024-01-15"
-                        last_end_date:
+                          description: First task start date for this person
+                            within the requested scope
+                          example: "2024-01-15 00:00:00"
+                        max_date:
                           type: string
-                          format: date
-                          example: "2024-03-21"
+                          description: Last task due date for this person
+                            within the requested scope
+                          example: "2024-03-21 00:00:00"
         """
-        permissions.check_admin_permissions()
-        args = self.get_args([("project_id", None, False, str)])
+        # Normalise the `project_id` filter once, before branching on the
+        # caller's role. An empty or whitespace-only `?project_id=` is treated
+        # as an absent filter; any other non-UUID value is rejected with a 400
+        # rather than reaching the query as an invalid UUID (which used to 500
+        # for admins and 404 for managers).
+        project_id = (self.get_project_id() or "").strip() or None
+        if project_id is not None and not fields.is_valid_id(project_id):
+            raise WrongParameterException("Invalid project_id.")
+        project_ids = None
+        if not permissions.has_admin_permissions():
+            permissions.check_manager_permissions()
+            if project_id is not None:
+                user_service.check_manager_project_access(project_id)
+            else:
+                project_ids = user_service.get_open_project_ids()
         return tasks_service.get_persons_tasks_dates(
-            project_id=args["project_id"]
+            project_id=project_id, project_ids=project_ids
         )
 
 
-class OpenTasksResource(Resource, ArgsMixin):
+class OpenTasksResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self):
@@ -2877,7 +3025,7 @@ class OpenTasksResource(Resource, ArgsMixin):
         )
 
 
-class OpenTasksStatsResource(Resource, ArgsMixin):
+class OpenTasksStatsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self):

@@ -1,11 +1,10 @@
 import datetime
 import ipaddress
 
-from flask import abort, request, current_app
-from flask_restful import Resource
+from flask import request, current_app
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
-from zou.app import config
 from zou.app.mixin import ArgsMixin
 from zou.app.services import (
     persons_service,
@@ -66,7 +65,7 @@ def _get_project_department_ids_for_person_access(person_id):
     return (project_ids, department_ids)
 
 
-class DesktopLoginsResource(Resource, ArgsMixin):
+class DesktopLoginsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id):
@@ -200,7 +199,7 @@ class DesktopLoginsResource(Resource, ArgsMixin):
         return desktop_login_log, 201
 
 
-class PresenceLogsResource(Resource):
+class PresenceLogsResource(MethodView):
 
     @jwt_required()
     def get(self, month_date):
@@ -242,7 +241,7 @@ class PresenceLogsResource(Resource):
         return csv_utils.build_csv_response(presence_logs)
 
 
-class TimeSpentsResource(Resource, ArgsMixin):
+class TimeSpentsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id):
@@ -334,7 +333,7 @@ class TimeSpentsResource(Resource, ArgsMixin):
             )
 
 
-class DateTimeSpentsResource(Resource):
+class DateTimeSpentsResource(MethodView):
 
     @jwt_required()
     def get(self, person_id, date):
@@ -409,7 +408,7 @@ class DateTimeSpentsResource(Resource):
             raise WrongParameterException("Invalid month or year.")
 
 
-class DayOffResource(Resource):
+class DayOffResource(MethodView):
 
     @jwt_required()
     def get(self, person_id, date):
@@ -476,7 +475,7 @@ class DayOffResource(Resource):
             raise WrongParameterException("Invalid date format.")
 
 
-class PersonDurationTimeSpentsResource(Resource, ArgsMixin):
+class PersonDurationTimeSpentsResource(MethodView, ArgsMixin):
 
     def get_project_department_arguments(self, person_id):
         project_id = self.get_project_id()
@@ -622,7 +621,7 @@ class PersonMonthTimeSpentsResource(PersonDurationTimeSpentsResource):
             raise WrongParameterException("Invalid date format.")
 
 
-class PersonMonthAllTimeSpentsResource(Resource):
+class PersonMonthAllTimeSpentsResource(MethodView):
 
     @jwt_required()
     def get(self, person_id, year, month):
@@ -851,6 +850,7 @@ class PersonQuotaMixin(ArgsMixin):
         return (project_id, task_type_id, feedback, weighted)
 
     def check_permissions(self, person_id, project_id=None):
+        user_service.resolve_project_role(project_id)
         if permissions.has_manager_permissions():
             user_service.check_manager_project_access(project_id)
         else:
@@ -881,7 +881,7 @@ class PersonQuotaMixin(ArgsMixin):
             raise WrongParameterException("Invalid month or year.")
 
 
-class PersonMonthQuotaShotsResource(Resource, PersonQuotaMixin):
+class PersonMonthQuotaShotsResource(MethodView, PersonQuotaMixin):
 
     def get_person_quotas(self, person_id, year, month, **kwargs):
         return shots_service.get_month_quota_shots(
@@ -944,7 +944,7 @@ class PersonMonthQuotaShotsResource(Resource, PersonQuotaMixin):
         return super().get(person_id, year, month)
 
 
-class PersonWeekQuotaShotsResource(Resource, PersonQuotaMixin):
+class PersonWeekQuotaShotsResource(MethodView, PersonQuotaMixin):
 
     def get_person_quotas(self, person_id, year, week, **kwargs):
         return shots_service.get_week_quota_shots(
@@ -1007,7 +1007,7 @@ class PersonWeekQuotaShotsResource(Resource, PersonQuotaMixin):
         return super().get(person_id, year, week)
 
 
-class PersonDayQuotaShotsResource(Resource, PersonQuotaMixin):
+class PersonDayQuotaShotsResource(MethodView, PersonQuotaMixin):
 
     def get_person_quotas(self, person_id, year, month, day, **kwargs):
         return shots_service.get_day_quota_shots(
@@ -1079,7 +1079,7 @@ class PersonDayQuotaShotsResource(Resource, PersonQuotaMixin):
         return super().get(person_id, year, month, day)
 
 
-class TimeSpentDurationResource(Resource, ArgsMixin):
+class TimeSpentDurationResource(MethodView, ArgsMixin):
     """
     Parent class for all durations time spents resource.
     """
@@ -1259,7 +1259,7 @@ class TimeSpentWeekResource(TimeSpentDurationResource):
         )
 
 
-class InvitePersonResource(Resource):
+class InvitePersonResource(MethodView):
 
     @jwt_required()
     def get(self, person_id):
@@ -1302,7 +1302,62 @@ class InvitePersonResource(Resource):
         return {"success": True, "message": "Email sent"}
 
 
-class DayOffForMonthResource(Resource, ArgsMixin):
+class ResetPasswordLinkResource(MethodView):
+
+    @jwt_required()
+    def post(self, person_id):
+        """
+        Get a password reset link
+        ---
+        description: Return the password reset link for the given person. It is
+          the same link as the one embedded in the password recovery email, so
+          an admin can share it manually (for instance when email delivery is
+          not configured). An already pending reset token is reused so a link
+          shared earlier stays valid; a new one is generated otherwise.
+        tags:
+          - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: true
+            schema:
+              type: string
+              format: uuid
+            description: Person unique identifier
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+          200:
+            description: Password reset link generated
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    reset_password_link:
+                      type: string
+                      description: Link to follow to choose a new password
+          400:
+            description: User is a protected account or another admin who
+              already has a password
+        """
+        user_service.check_person_is_not_bot(person_id)
+        permissions.check_admin_permissions()
+        current_user = persons_service.get_current_user()
+        try:
+            person = persons_service.check_password_change_allowed(person_id)
+            reset_password_link = (
+                persons_service.get_or_create_password_reset_link(person_id)
+            )
+            current_app.logger.info(
+                f"User {current_user['email']} generated a password reset "
+                f"link for {person['email']}"
+            )
+            return {"reset_password_link": reset_password_link}
+        except PersonInProtectedAccounts as exception:
+            return {"error": True, "message": exception.description}, 400
+
+
+class DayOffForMonthResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, year, month):
@@ -1349,7 +1404,7 @@ class DayOffForMonthResource(Resource, ArgsMixin):
             )
 
 
-class PersonWeekDayOffResource(Resource, ArgsMixin):
+class PersonWeekDayOffResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id, year, week):
@@ -1401,7 +1456,7 @@ class PersonWeekDayOffResource(Resource, ArgsMixin):
         )
 
 
-class PersonMonthDayOffResource(Resource, ArgsMixin):
+class PersonMonthDayOffResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id, year, month):
@@ -1453,7 +1508,7 @@ class PersonMonthDayOffResource(Resource, ArgsMixin):
         )
 
 
-class PersonYearDayOffResource(Resource, ArgsMixin):
+class PersonYearDayOffResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id, year):
@@ -1496,7 +1551,7 @@ class PersonYearDayOffResource(Resource, ArgsMixin):
         )
 
 
-class PersonDayOffResource(Resource, ArgsMixin):
+class PersonDayOffResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id):
@@ -1532,7 +1587,7 @@ class PersonDayOffResource(Resource, ArgsMixin):
         )
 
 
-class AddToDepartmentResource(Resource, ArgsMixin):
+class AddToDepartmentResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, person_id):
@@ -1600,7 +1655,7 @@ class AddToDepartmentResource(Resource, ArgsMixin):
         return person, 201
 
 
-class RemoveFromDepartmentResource(Resource, ArgsMixin):
+class RemoveFromDepartmentResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def delete(self, person_id, department_id):
@@ -1642,7 +1697,7 @@ class RemoveFromDepartmentResource(Resource, ArgsMixin):
         return "", 204
 
 
-class ChangePasswordForPersonResource(Resource, ArgsMixin):
+class ChangePasswordForPersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, person_id):
@@ -1719,18 +1774,7 @@ class ChangePasswordForPersonResource(Resource, ArgsMixin):
         password, password_2 = body.password, body.password_2
         current_user = persons_service.get_current_user()
         try:
-            person = persons_service.get_person(person_id)
-            if person["id"] != current_user["id"]:
-                if person["email"] in config.PROTECTED_ACCOUNTS:
-                    raise PersonInProtectedAccounts(
-                        "This user is in protected accounts."
-                    )
-                elif person["role"] == "admin":
-                    person_raw = persons_service.get_person_raw(person_id)
-                    if person_raw.password is not None:
-                        raise PersonInProtectedAccounts(
-                            "An admin can't change another admin's password."
-                        )
+            person = persons_service.check_password_change_allowed(person_id)
             auth.validate_password(password, password_2)
             password = auth.encrypt_password(password)
             persons_service.update_password(person["email"], password)
@@ -1771,7 +1815,7 @@ class ChangePasswordForPersonResource(Resource, ArgsMixin):
             )
 
 
-class DisableTwoFactorAuthenticationPersonResource(Resource, ArgsMixin):
+class DisableTwoFactorAuthenticationPersonResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def delete(self, person_id):
@@ -1858,7 +1902,7 @@ class DisableTwoFactorAuthenticationPersonResource(Resource, ArgsMixin):
             }, 400
 
 
-class ClearAvatarPersonResource(Resource):
+class ClearAvatarPersonResource(MethodView):
     @jwt_required()
     def delete(self, person_id):
         """

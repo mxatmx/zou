@@ -1,3 +1,15 @@
+"""
+Pull-based synchronization from another Kitsu instance through gazu.
+
+The service logs in to a remote instance and mirrors its data locally,
+model by model, following the API event log to fetch only what changed
+since the last run (see _fetch_events / cursor_event_id). It is meant
+for one-way replication (a studio mirror, a backup instance); it never
+pushes local changes back. File synchronization (previews, thumbnails)
+downloads to a temporary path first and cleans it up on failure so a
+partial download never lands in the store.
+"""
+
 import datetime
 import logging
 import os
@@ -58,7 +70,7 @@ from zou.app.models.working_file import WorkingFile
 from zou.app.services import deletion_service, tasks_service, projects_service
 from zou.app.stores import file_store
 from zou.app.utils import events, date_helpers
-from zou.app import app
+from zou.app import config
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOGLEVEL", "INFO").upper())
@@ -69,7 +81,7 @@ logger.addHandler(console_handler)
 lock = RLock()
 
 
-preview_folder = app.config["PREVIEW_FOLDER"]
+preview_folder = config.PREVIEW_FOLDER
 local_picture = LocalBackend(
     "local", {"root": os.path.join(preview_folder, "pictures")}
 )
@@ -605,6 +617,38 @@ def _push_batch(path, payload, batch_size=200, label=None, silent=True):
         logger.info(f"  {display}: pushed {total} rows")
 
 
+def _add_time_window(path, minutes):
+    """
+    Append before/after query parameters covering the last given minutes.
+    """
+    now = date_helpers.get_utc_now_datetime()
+    min_before = now - datetime.timedelta(minutes=minutes)
+    after = min_before.strftime("%Y-%m-%dT%H:%M:%S")
+    path += f'&before={now.strftime("%Y-%m-%dT%H:%M:%S")}'
+    path += f"&after={after}"
+    return path
+
+
+def _fetch_events(path, limit, paginate):
+    """
+    Fetch events from the source instance, newest first. When paginate is
+    set, follow the cursor until the whole time window is covered, so a
+    burst bigger than the page size does not silently drop events.
+    """
+    events = []
+    cursor = None
+    while True:
+        page_path = path
+        if cursor is not None:
+            page_path += f"&cursor_event_id={cursor}"
+        page = gazu.client.fetch_all(page_path)
+        events += page
+        if not paginate or len(page) < limit:
+            break
+        cursor = page[-1]["id"]
+    return events
+
+
 def run_last_events_sync(minutes=0, limit=300):
     """
     Retrieve last events from source instance and import related data and
@@ -612,12 +656,8 @@ def run_last_events_sync(minutes=0, limit=300):
     """
     path = f"events/last?limit={limit}"
     if minutes > 0:
-        now = date_helpers.get_utc_now_datetime()
-        min_before = now - datetime.timedelta(minutes=minutes)
-        after = min_before.strftime("%Y-%m-%dT%H:%M:%S")
-        path += f'&before={now.strftime("%Y-%m-%dT%H:%M:%S")}'
-        path += f"&after={after}"
-    events = gazu.client.fetch_all(path)
+        path = _add_time_window(path, minutes)
+    events = _fetch_events(path, limit, paginate=minutes > 0)
     events.reverse()
     for event in events:
         event_name = event["name"].split(":")[0]
@@ -625,7 +665,9 @@ def run_last_events_sync(minutes=0, limit=300):
             try:
                 sync_event(event)
             except Exception:
-                pass
+                logger.exception(
+                    f"Failed to sync event {event['id']} ({event['name']})"
+                )
 
 
 def run_last_events_files(minutes=0, limit=50):
@@ -635,12 +677,8 @@ def run_last_events_files(minutes=0, limit=50):
     """
     path = f"events/last?only_files=true&limit={limit}"
     if minutes > 0:
-        now = date_helpers.get_utc_now_datetime()
-        min_before = now - datetime.timedelta(minutes=minutes)
-        after = min_before.strftime("%Y-%m-%dT%H:%M:%S")
-        path += f'&before={now.strftime("%Y-%m-%dT%H:%M:%S")}'
-        path += f"&after={after}"
-    events = gazu.client.fetch_all(path)
+        path = _add_time_window(path, minutes)
+    events = _fetch_events(path, limit, paginate=minutes > 0)
     events.reverse()
     for event in events:
         event_name = event["name"].split(":")[0]
@@ -1062,7 +1100,12 @@ def download_file(file_path, prefix, dl_func, preview_file_id):
                 tmp_file.write(chunk)
         logger.info(f"{file_path} downloaded")
     except Exception:
-        pass
+        # A partial file would be mistaken for a valid download on the
+        # next sync run: remove it and log instead of failing the whole
+        # sync for one file.
+        logger.exception(f"Failed to download {prefix} {preview_file_id}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 
 def download_preview(preview_file):
@@ -1540,6 +1583,8 @@ def download_file_from_another_instance(
     force=False,
     dict_errors={},
 ):
+    from zou.app import app
+
     with app.app_context():
         if force or not exist_func(prefix, id):
             for attemps_count in range(0, number_attemps):

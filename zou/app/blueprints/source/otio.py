@@ -1,17 +1,18 @@
 import os
 import pathlib
-import opentimelineio as otio
 import re
 
 from string import Template
 
 from flask import request, current_app
-from flask_restful import Resource, inputs
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app import config
 
 from zou.app.mixin import ArgsMixin
+from zou.app.services.exception import WrongParameterException
+from zou.app.utils import fields
 from zou.app.services import (
     shots_service,
     projects_service,
@@ -40,7 +41,7 @@ mapping_substitutions_to_regex = {
 }
 
 
-class OTIOBaseResource(Resource, ArgsMixin):
+class OTIOBaseResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def post(self, project_id, episode_id=None):
@@ -77,8 +78,12 @@ class OTIOBaseResource(Resource, ArgsMixin):
         args = self.post_args()
         user_service.check_manager_project_access(project_id)
         uploaded_file = request.files["file"]
-        file_name = uploaded_file.filename
-        file_path = os.path.join(config.TMP_DIR, file_name)
+        # run_import selects the OTIO adapter from the extension.
+        extension = os.path.splitext(uploaded_file.filename or "")[1]
+        extension = re.sub(r"[^A-Za-z0-9.]", "", extension)
+        file_path = os.path.join(
+            config.TMP_DIR, f"{fields.gen_uuid()}{extension}"
+        )
         uploaded_file.save(file_path)
         try:
             result = self.run_import(
@@ -88,6 +93,10 @@ class OTIOBaseResource(Resource, ArgsMixin):
                 args["naming_convention"],
                 args["match_case"],
             )
+        except WrongParameterException:
+            # User input error (unsupported or unparseable file): the global
+            # handler answers 400, no server-error log.
+            raise
         except Exception as e:
             current_app.logger.error(
                 f"Import OTIO failed: {type(e).__name__}: {str(e)}"
@@ -161,15 +170,25 @@ class OTIOBaseResource(Resource, ArgsMixin):
         match_case,
     ):
         result = {"updated_shots": [], "created_shots": []}
+        import opentimelineio as otio
+
+        suffix = pathlib.Path(file_path).suffix.lstrip(".").lower()
+        supported = otio.adapters.suffixes_with_defined_adapters(read=True)
+        if suffix not in supported:
+            raise WrongParameterException(
+                f"Unsupported file type '.{suffix}'. Supported formats: "
+                f"{', '.join(sorted(supported))}."
+            )
         try:
             kwargs = {}
-            extension = pathlib.Path(file_path).suffix
-            if extension == ".edl":
+            if suffix == "edl":
                 kwargs["rate"] = projects_service.get_project_fps(project_id)
                 kwargs["ignore_timecode_mismatch"] = True
             timeline = otio.adapters.read_from_file(file_path, **kwargs)
         except Exception as e:
-            raise Exception(f"Failed to parse OTIO file: {str(e)}")
+            raise WrongParameterException(
+                f"Failed to parse OTIO file: {str(e)}"
+            )
 
         self.prepare_import(
             project_id,
@@ -420,7 +439,7 @@ class OTIOImportResource(OTIOBaseResource):
                     False,
                     str,
                 ),
-                ("match_case", True, False, inputs.boolean),
+                ("match_case", True, False, fields.boolean),
             ]
         )
 
@@ -554,6 +573,6 @@ class OTIOImportEpisodeResource(OTIOBaseResource):
                     False,
                     str,
                 ),
-                ("match_case", True, False, inputs.boolean),
+                ("match_case", True, False, fields.boolean),
             ]
         )

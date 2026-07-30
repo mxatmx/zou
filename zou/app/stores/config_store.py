@@ -1,8 +1,11 @@
-import sys
+import logging
 
 import redis
 
 from zou.app import config
+from zou.app.stores import redis_client
+
+logger = logging.getLogger(__name__)
 
 USER_LIMIT_KEY = "config:user_limit"
 DEFAULT_TIMEZONE_KEY = "config:default_timezone"
@@ -11,19 +14,8 @@ NOMAD_HOST_KEY = "config:nomad_host"
 NOMAD_NORMALIZE_JOB_KEY = "config:nomad_normalize_job"
 NOMAD_PLAYLIST_JOB_KEY = "config:nomad_playlist_job"
 
-try:
-    config_store = redis.StrictRedis(
-        host=config.KEY_VALUE_STORE["host"],
-        port=config.KEY_VALUE_STORE["port"],
-        db=config.KV_CONFIG_DB_INDEX,
-        password=config.KEY_VALUE_STORE["password"],
-        decode_responses=True,
-    )
-    config_store.ping()
-except redis.ConnectionError:
-    config_store = None
-    if "pytest" not in sys.modules:
-        print("Cannot access to the required Redis instance")
+# Lazily connected: the pool opens on the first command, not at import.
+config_store = redis_client.get_client(config.KV_CONFIG_DB_INDEX)
 
 
 def _get_redis_raw(key):
@@ -31,7 +23,7 @@ def _get_redis_raw(key):
         try:
             return config_store.get(key)
         except redis.ConnectionError:
-            pass
+            logger.warning(f"Redis unavailable while reading {key}")
     return None
 
 
@@ -42,7 +34,7 @@ def _get(key, fallback):
             if value is not None:
                 return value
         except redis.ConnectionError:
-            pass
+            logger.warning(f"Redis unavailable while reading {key}")
     return fallback
 
 
@@ -53,7 +45,7 @@ def _sync(key, env_value):
             if current is None or str(current) != str(env_value):
                 config_store.set(key, env_value)
         except redis.ConnectionError:
-            pass
+            logger.warning(f"Redis unavailable while syncing {key}")
     return env_value
 
 

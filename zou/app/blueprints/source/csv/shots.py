@@ -21,7 +21,7 @@ from zou.app.services.tasks_service import (
 )
 from zou.app.services.comments_service import create_comment
 from zou.app.services.exception import WrongParameterException
-from zou.app.utils import events, string
+from zou.app.utils import events
 
 
 class ShotsCsvImportResource(BaseCsvProjectImportResource):
@@ -258,12 +258,35 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
             shot_new_values["data"] = entity.data.copy()
 
         frame_in = row.get("Frame In", None) or row.get("In", None)
-        if frame_in is not None:
-            shot_new_values["data"]["frame_in"] = frame_in
+        if frame_in is not None and frame_in != "":
+            try:
+                shot_new_values["data"]["frame_in"] = int(frame_in)
+            except (ValueError, TypeError):
+                raise RowException(
+                    f"frame_in must be an integer, got '{frame_in}'"
+                )
 
         frame_out = row.get("Frame Out", None) or row.get("Out", None)
-        if frame_out is not None:
-            shot_new_values["data"]["frame_out"] = frame_out
+        if frame_out is not None and frame_out != "":
+            try:
+                shot_new_values["data"]["frame_out"] = int(frame_out)
+            except (ValueError, TypeError):
+                raise RowException(
+                    f"frame_out must be an integer, got '{frame_out}'"
+                )
+
+        # Keep the frame count consistent with an imported frame range when
+        # the CSV doesn't provide it explicitly.
+        if "nb_frames" not in shot_new_values:
+            try:
+                frame_in_value = int(shot_new_values["data"]["frame_in"])
+                frame_out_value = int(shot_new_values["data"]["frame_out"])
+                if frame_out_value > frame_in_value:
+                    shot_new_values["nb_frames"] = (
+                        frame_out_value - frame_in_value + 1
+                    )
+            except (KeyError, TypeError, ValueError):
+                pass
 
         fps = row.get("FPS", None)
         if fps is not None:
@@ -273,16 +296,9 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
         if resolution is not None:
             shot_new_values["data"]["resolution"] = resolution
 
-        for name, descriptor in self.descriptor_fields.items():
-            if name in row:
-                if descriptor["data_type"] == "boolean":
-                    shot_new_values["data"][descriptor["field_name"]] = (
-                        "true" if string.strtobool(row[name]) else "false"
-                    )
-                else:
-                    shot_new_values["data"][descriptor["field_name"]] = row[
-                        name
-                    ]
+        shot_new_values["data"] = self.get_descriptor_values(
+            row, shot_new_values["data"]
+        )
 
         tasks_update = self.get_tasks_update(row)
 

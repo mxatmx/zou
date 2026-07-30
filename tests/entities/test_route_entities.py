@@ -1,6 +1,7 @@
 from tests.base import ApiDBTestCase
 
 from zou.app.models.time_spent import TimeSpent
+from zou.app.utils import fields
 from zou.app.models.entity import EntityConceptLink
 from zou.app.services import (
     comments_service,
@@ -82,3 +83,59 @@ class EntityRoutesTestCase(ApiDBTestCase):
             f"/data/entities/{self.asset.id}/entities-linked/with-tasks"
         )
         self.assertTrue(len(result) > 0)
+
+    def test_delete_entities(self):
+        self.generate_fixture_sequence()
+        self.generate_fixture_shot()
+        asset_id = str(self.asset.id)
+        shot_id = str(self.shot.id)
+        path = f"/actions/projects/{self.project.id}/delete-entities"
+        result = self.post(path, [asset_id, shot_id], 200)
+        self.assertEqual(result, [asset_id, shot_id])
+        # The asset has a task: it is canceled, not removed.
+        asset = self.get(f"/data/assets/{asset_id}")
+        self.assertTrue(asset["canceled"])
+        # The shot has no task: it is removed for real.
+        self.get(f"/data/shots/{shot_id}", 404)
+
+    def test_delete_entities_removes_canceled_asset(self):
+        self.asset.update({"canceled": True})
+        asset_id = str(self.asset.id)
+        path = f"/actions/projects/{self.project.id}/delete-entities"
+        self.post(path, [asset_id], 200)
+        self.get(f"/data/assets/{asset_id}", 404)
+
+    def test_delete_entities_ignores_absent_entities(self):
+        # An id that no longer exists (e.g. deleted by someone else) must not
+        # fail the whole batch: it is skipped and the others are processed.
+        self.asset.update({"canceled": True})
+        asset_id = str(self.asset.id)
+        missing_id = str(fields.gen_uuid())
+        path = f"/actions/projects/{self.project.id}/delete-entities"
+        result = self.post(path, [missing_id, asset_id], 200)
+        self.assertEqual(result, [asset_id])
+        self.get(f"/data/assets/{asset_id}", 404)
+
+    def test_delete_entities_skips_unsupported_entity_type(self):
+        self.generate_fixture_sequence()
+        sequence_id = str(self.sequence.id)
+        path = f"/actions/projects/{self.project.id}/delete-entities"
+        result = self.post(path, [sequence_id], 200)
+        # A sequence is not a deletable type: it is skipped, not deleted.
+        self.assertEqual(result, [])
+        self.get(f"/data/entities/{sequence_id}")
+
+    def test_delete_entities_skips_entity_from_other_project(self):
+        asset_id = str(self.asset.id)
+        other_project = self.generate_fixture_project(name="Other Project")
+        path = f"/actions/projects/{other_project.id}/delete-entities"
+        result = self.post(path, [asset_id], 200)
+        # The asset belongs to another project: it is skipped, not deleted.
+        self.assertEqual(result, [])
+        self.get(f"/data/assets/{asset_id}")
+
+    def test_delete_entities_as_artist_is_forbidden(self):
+        self.generate_fixture_user_cg_artist()
+        self.log_in_cg_artist()
+        path = f"/actions/projects/{self.project.id}/delete-entities"
+        self.post(path, [str(self.asset.id)], 403)

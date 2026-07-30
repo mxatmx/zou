@@ -1,18 +1,17 @@
 import os
 import shutil
 import math
-import cv2
-import numpy
 
 from pathlib import Path
 
 from PIL import Image, ImageFile
 
+from zou.app import config
 from zou.app.utils import fs
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-Image.MAX_IMAGE_PIXELS = 20000 * 20000
+Image.MAX_IMAGE_PIXELS = config.MAX_IMAGE_PIXELS
 RECTANGLE_SIZE = 150, 100
 SQUARE_SIZE = 100, 100
 PREVIEW_SIZE = 1200, 0
@@ -218,6 +217,9 @@ def turn_hdr_into_thumbnail(original_path, size=BIG_RECTANGLE_SIZE):
     """
     Turn an HDR file into a thumbnail.
     """
+    import cv2
+    import numpy
+
     file_target_path = Path(original_path).with_suffix(".png")
     hdr = cv2.imread(original_path, flags=cv2.IMREAD_ANYDEPTH)
     # Simply clamp values to a 0-1 range for tone-mapping

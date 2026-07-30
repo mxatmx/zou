@@ -1,3 +1,18 @@
+"""
+Realtime event stream (WebSocket) server.
+
+This process fans out Zou events and hosts the collaborative "preview
+rooms". SocketIO message delivery is shared across processes through the
+Redis message_queue, BUT the presence state below (rooms_data,
+user_rooms, server_stats) lives in this process's memory.
+
+Consequence: run the event stream as a SINGLE process. It uses gevent
+(one process, many greenlets) and is meant to be deployed that way; do
+NOT put it behind several gunicorn workers or the room playback state
+and connection counts diverge per worker. Horizontal scaling would
+require moving that presence state into Redis (see ARCH-12 / MEM-8).
+"""
+
 from gevent import monkey
 
 monkey.patch_all()
@@ -10,8 +25,11 @@ from flask_jwt_extended import (
 )
 from flask_socketio import SocketIO, disconnect, join_room, leave_room, emit
 
-from zou.app import config, app
+from zou.app import config, create_app
 from zou.app.utils.redis import get_redis_url
+
+app = create_app()
+
 from zou.app.services.playlists_service import get_playlist
 from zou.app.services.user_service import check_project_access
 

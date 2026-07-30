@@ -1,4 +1,4 @@
-from flask_restful import Resource
+from flask.views import MethodView
 
 from flask_jwt_extended import jwt_required
 
@@ -8,7 +8,7 @@ from zou.app.services import index_service, projects_service, user_service
 from zou.app.blueprints.search.schemas import SearchSchema
 
 
-class SearchResource(Resource, ArgsMixin):
+class SearchResource(MethodView, ArgsMixin):
     @jwt_required()
     def post(self):
         """
@@ -115,7 +115,10 @@ class SearchResource(Resource, ArgsMixin):
 
         if "persons" in index_names:
             results["persons"] = index_service.search_persons(
-                query, limit=limit, offset=offset
+                query,
+                limit=limit,
+                offset=offset,
+                minimal=not permissions.has_admin_permissions(),
             )
         if "assets" in index_names:
             if (

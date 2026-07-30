@@ -4,7 +4,7 @@ import hashlib
 from tests.base import ApiDBTestCase
 
 from zou.app.utils import fs, thumbnail
-from zou.app.services import assets_service
+from zou.app.services import assets_service, projects_service
 
 from PIL import Image
 
@@ -68,6 +68,13 @@ class RouteThumbnailTestCase(ApiDBTestCase):
 
         self.assertEqual(result_image.size, thumbnail.BIG_SQUARE_SIZE)
 
+    def test_add_thumbnail_without_file_keeps_has_avatar_false(self):
+        path = f"/pictures/thumbnails/persons/{self.person_id}"
+        response = self.app.post(path, headers=self.base_headers)
+        self.assertEqual(response.status_code, 400)
+        person = self.get(f"data/persons/{self.person_id}")
+        self.assertFalse(person["has_avatar"])
+
     def test_add_preview(self):
         path = f"/pictures/preview-files/{self.preview_file_id}"
 
@@ -113,6 +120,18 @@ class RouteThumbnailTestCase(ApiDBTestCase):
 
         asset = assets_service.get_asset(self.asset_id)
         self.assertEqual(asset["preview_file_id"], str(self.preview_file_id))
+
+    def test_set_main_preview_as_client(self):
+        # A client can review but must not redefine the entity thumbnail.
+        self.generate_fixture_user_client()
+        projects_service.add_team_member(
+            str(self.project.id), self.user_client["id"]
+        )
+        self.log_in_client()
+        path = (
+            f"/actions/preview-files/{self.preview_file_id}/set-main-preview"
+        )
+        self.put(path, {}, 403)
 
     def test_add_preview_background(self):
         self.generate_fixture_preview_background_file()

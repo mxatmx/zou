@@ -1,5 +1,5 @@
 from flask import request
-from flask_restful import Resource
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 
 from zou.app.services import (
@@ -19,7 +19,7 @@ from zou.app.blueprints.breakdown.schemas import (
 )
 
 
-class CastingResource(Resource):
+class CastingResource(MethodView):
     @jwt_required()
     def get(self, project_id, entity_id):
         """
@@ -78,6 +78,9 @@ class CastingResource(Resource):
         """
         user_service.check_project_access(project_id)
         if permissions.has_vendor_permissions():
+            raise permissions.PermissionDenied
+        entity = entities_service.get_entity(entity_id)
+        if entity["project_id"] != project_id:
             raise permissions.PermissionDenied
         return breakdown_service.get_casting(entity_id)
 
@@ -166,10 +169,81 @@ class CastingResource(Resource):
                 "message": "Request body must be a JSON array",
             }, 400
         user_service.check_manager_project_access(project_id)
+        entity = entities_service.get_entity(entity_id)
+        if entity["project_id"] != project_id:
+            raise permissions.PermissionDenied
         return breakdown_service.update_casting(entity_id, casting)
 
 
-class EpisodesCastingResource(Resource):
+class EntitiesCastingResource(MethodView):
+    @jwt_required()
+    def put(self, project_id):
+        """
+        Update several entity castings
+        ---
+        description: Modify the casting of several entities of a project in
+          a single request. The request body maps entity ids to casting
+          arrays, each following the same format as the single entity
+          casting route.
+        tags:
+          - Breakdown
+        parameters:
+          - in: path
+            name: project_id
+            required: true
+            type: string
+            format: uuid
+            example: a24a6ea4-ce75-4665-a070-57453082c25
+            description: Unique identifier of the project
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Map of entity ids to casting arrays
+                additionalProperties:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      asset_id:
+                        type: string
+                        format: uuid
+                        description: Asset identifier to link
+                      nb_occurences:
+                        type: integer
+                        description: Number of occurences of the asset
+        responses:
+          200:
+            description: Map of entity ids to their updated casting
+            content:
+              application/json:
+                schema:
+                  type: object
+        """
+        castings = request.json
+        if not isinstance(castings, dict) or not all(
+            isinstance(casting, list) for casting in castings.values()
+        ):
+            return {
+                "error": True,
+                "message": "Request body must be a JSON object mapping "
+                "entity ids to casting arrays",
+            }, 400
+        user_service.check_manager_project_access(project_id)
+        # Validate every entity before updating anything.
+        for entity_id in castings.keys():
+            entity = entities_service.get_entity(entity_id)
+            if entity["project_id"] != project_id:
+                raise permissions.PermissionDenied
+        return {
+            entity_id: breakdown_service.update_casting(entity_id, casting)
+            for entity_id, casting in castings.items()
+        }
+
+
+class EpisodesCastingResource(MethodView):
     @jwt_required()
     def get(self, project_id):
         """
@@ -226,7 +300,7 @@ class EpisodesCastingResource(Resource):
         return breakdown_service.get_production_episodes_casting(project_id)
 
 
-class EpisodeSequenceAllCastingResource(Resource):
+class EpisodeSequenceAllCastingResource(MethodView):
     @jwt_required()
     def get(self, project_id, episode_id):
         """
@@ -292,7 +366,7 @@ class EpisodeSequenceAllCastingResource(Resource):
         )
 
 
-class SequenceAllCastingResource(Resource):
+class SequenceAllCastingResource(MethodView):
     @jwt_required()
     def get(self, project_id):
         """
@@ -358,7 +432,7 @@ class SequenceAllCastingResource(Resource):
         return breakdown_service.get_all_sequences_casting(project_id)
 
 
-class SequenceCastingResource(Resource):
+class SequenceCastingResource(MethodView):
     @jwt_required()
     def get(self, project_id, sequence_id):
         """
@@ -424,11 +498,13 @@ class SequenceCastingResource(Resource):
         user_service.check_project_access(project_id)
         if permissions.has_vendor_permissions():
             raise permissions.PermissionDenied
-        shots_service.get_sequence(sequence_id)
+        sequence = shots_service.get_sequence(sequence_id)
+        if sequence["project_id"] != project_id:
+            raise permissions.PermissionDenied
         return breakdown_service.get_sequence_casting(sequence_id)
 
 
-class AssetTypeCastingResource(Resource):
+class AssetTypeCastingResource(MethodView):
     @jwt_required()
     def get(self, project_id, asset_type_id):
         """
@@ -504,7 +580,7 @@ class AssetTypeCastingResource(Resource):
         )
 
 
-class ShotAssetInstancesResource(Resource, ArgsMixin):
+class ShotAssetInstancesResource(MethodView, ArgsMixin):
     @jwt_required()
     def get(self, shot_id):
         """
@@ -633,7 +709,7 @@ class ShotAssetInstancesResource(Resource, ArgsMixin):
         return shot, 201
 
 
-class RemoveShotAssetInstanceResource(Resource, ArgsMixin):
+class RemoveShotAssetInstanceResource(MethodView, ArgsMixin):
     @jwt_required()
     def delete(self, shot_id, asset_instance_id):
         """
@@ -669,7 +745,7 @@ class RemoveShotAssetInstanceResource(Resource, ArgsMixin):
         return "", 204
 
 
-class SceneAssetInstancesResource(Resource, ArgsMixin):
+class SceneAssetInstancesResource(MethodView, ArgsMixin):
     @jwt_required()
     def get(self, scene_id):
         """
@@ -801,7 +877,7 @@ class SceneAssetInstancesResource(Resource, ArgsMixin):
         return asset_instance, 201
 
 
-class SceneCameraInstancesResource(Resource):
+class SceneCameraInstancesResource(MethodView):
     @jwt_required()
     def get(self, scene_id):
         """
@@ -858,7 +934,7 @@ class SceneCameraInstancesResource(Resource):
         return breakdown_service.get_camera_instances_for_scene(scene_id)
 
 
-class ProjectEntityLinksResource(Resource, ArgsMixin):
+class ProjectEntityLinksResource(MethodView, ArgsMixin):
     @jwt_required()
     def get(self, project_id):
         """
@@ -938,7 +1014,7 @@ class ProjectEntityLinksResource(Resource, ArgsMixin):
         )
 
 
-class ProjectEntityLinkResource(Resource):
+class ProjectEntityLinkResource(MethodView):
     @jwt_required()
     def delete(self, project_id, entity_link_id):
         """
@@ -967,4 +1043,8 @@ class ProjectEntityLinkResource(Resource):
             description: Entity link successfully deleted
         """
         user_service.check_manager_project_access(project_id)
+        link = entities_service.get_entity_link(entity_link_id)
+        entity = entities_service.get_entity(link["entity_in_id"])
+        if entity["project_id"] != project_id:
+            raise permissions.PermissionDenied
         return entities_service.remove_entity_link(entity_link_id)

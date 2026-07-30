@@ -17,16 +17,16 @@ from alembic import command
 from alembic.config import Config
 from collections.abc import MutableMapping
 from flask import Blueprint, send_from_directory, abort, current_app
-from flask_restful import Resource
+from flask.views import MethodView
 from pathlib import Path
 from sqlalchemy import MetaData
 from sqlalchemy.util import FacadeDict
 
-from zou.app import db, app
+from zou.app import db
 from zou.app.utils.api import configure_api_from_blueprint
 
 
-class StaticResource(Resource):
+class StaticResource(MethodView):
 
     plugin_id = None
 
@@ -216,8 +216,12 @@ def _build_plugin_alembic_config(plugin_path):
         "script_location", str(PLUGIN_ALEMBIC_TEMPLATE_DIR)
     )
     alembic_cfg.set_main_option("version_locations", str(versions_dir))
+    # Escape % for configparser, which Alembic uses internally and would
+    # otherwise treat percent-encoded characters in the URI (e.g. a "!" in
+    # the DB password rendered as "%21") as interpolation tokens.
     alembic_cfg.set_main_option(
-        "sqlalchemy.url", current_app.config["SQLALCHEMY_DATABASE_URI"]
+        "sqlalchemy.url",
+        current_app.config["SQLALCHEMY_DATABASE_URI"].replace("%", "%%"),
     )
     alembic_cfg.attributes["plugin_path"] = str(plugin_path)
     return alembic_cfg
@@ -504,6 +508,8 @@ def create_plugin_metadata(plugin_id):
     their tables fresh, and Alembic won't try to create/drop Zou's
     core tables.
     """
+    from zou.app import app
+
     plugin_metadata = MetaData()
     with app.app_context():
         plugin_metadata.reflect(bind=db.engine)

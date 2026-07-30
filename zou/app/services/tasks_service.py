@@ -1,12 +1,27 @@
+"""
+Business logic for tasks: assignation, status changes, comments, time
+spent and the aggregated "todos"/"open tasks" views.
+
+Two conventions matter when editing this module:
+- get_task()/get_task_status()/... return serialized dicts and are
+  memoized; every mutation must invalidate its entry (clear_task_cache
+  and friends) or clients keep reading stale data.
+- Several imports of other services are done lazily inside functions to
+  break import cycles (tasks <-> shots <-> entities). Keep them local
+  when adding cross-service calls.
+"""
+
 import collections
 import uuid
 
+from sqlalchemy import and_
 from sqlalchemy.exc import StatementError, IntegrityError, DataError
 from sqlalchemy.sql import func
 from sqlalchemy.sql.expression import case
 from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm.exc import StaleDataError
 
-from zou.app import app, db
+from zou.app import config, db
 from zou.app.utils import events
 
 from zou.app.models.attachment_file import AttachmentFile
@@ -23,7 +38,11 @@ from zou.app.models.entity_type import EntityType, TaskTypeAssetTypeLink
 from zou.app.models.news import News
 from zou.app.models.person import Person
 from zou.app.models.preview_file import PreviewFile
-from zou.app.models.project import Project, ProjectTaskTypeLink
+from zou.app.models.project import (
+    Project,
+    ProjectPersonLink,
+    ProjectTaskTypeLink,
+)
 from zou.app.models.project_status import ProjectStatus
 from zou.app.models.task import Task, TaskPersonLink
 from zou.app.models.task_type import TaskType
@@ -122,7 +141,7 @@ def get_task_statuses():
 
 @cache.memoize_function(120)
 def get_to_review_status():
-    return get_or_create_status(app.config["TO_REVIEW_TASK_STATUS"], "pndng")
+    return get_or_create_status(config.TO_REVIEW_TASK_STATUS, "pndng")
 
 
 @cache.memoize_function(120)
@@ -454,7 +473,10 @@ def _resolve_episode_and_build_task_dict(
             except EpisodeNotFoundException:
                 episode_name = "MP"
 
-    task_dict = get_task(str(task.id), relations=True)
+    # Serialize the Task instance already carried by the row instead of
+    # re-fetching it through get_task (one query per row on cache miss).
+    # Assignees are attached in batch by the callers.
+    task_dict = task.serialize()
     if entity_type_name == "Sequence" and entity_parent_id is not None:
         episode_id = entity_parent_id
         episode = shots_service.get_episode(episode_id)
@@ -744,7 +766,16 @@ def _prepare_query(task_id, is_client, is_manager):
         )
     )
     if not is_manager and not is_client:
-        query = query.filter(Person.role != "client")
+        task = get_task(task_id)
+        query = query.outerjoin(
+            ProjectPersonLink,
+            and_(
+                ProjectPersonLink.person_id == Person.id,
+                ProjectPersonLink.project_id == task["project_id"],
+            ),
+        ).filter(
+            func.coalesce(ProjectPersonLink.role, Person.role) != "client"
+        )
     return query
 
 
@@ -1123,6 +1154,8 @@ def get_person_tasks(person_id, projects, is_done=None):
             ]
         tasks.append(task_dict)
 
+    if tasks:
+        _attach_assignee_ids(tasks)
     _add_last_comments_to_tasks(tasks)
     return tasks
 
@@ -1200,6 +1233,8 @@ def get_person_tasks_to_check(project_ids=None, department_ids=None):
         )
         tasks.append(task_dict)
 
+    if tasks:
+        _attach_assignee_ids(tasks)
     _add_last_comments_to_tasks(tasks)
     return tasks
 
@@ -1209,7 +1244,15 @@ def get_last_comment_map(task_ids):
     comments = (
         Comment.query.filter(Comment.object_id.in_(task_ids))
         .join(Person, Comment.person_id == Person.id)
-        .filter(Person.role != "client")
+        .join(Task, Comment.object_id == Task.id)
+        .outerjoin(
+            ProjectPersonLink,
+            and_(
+                ProjectPersonLink.person_id == Person.id,
+                ProjectPersonLink.project_id == Task.project_id,
+            ),
+        )
+        .filter(func.coalesce(ProjectPersonLink.role, Person.role) != "client")
         .order_by(Comment.object_id, Comment.created_at)
         .all()
     )
@@ -1454,11 +1497,18 @@ def update_task(task_id, data):
     """
     task = get_task_raw(task_id)
 
-    if is_finished(task, data):
-        data["end_date"] = date_helpers.get_utc_now_datetime()
-
-    if is_done(task, data):
-        data["done_date"] = date_helpers.get_utc_now_datetime()
+    if "task_status_id" in data and data["task_status_id"] != str(
+        task.task_status_id
+    ):
+        new_status = get_task_status_raw(data["task_status_id"])
+        now = date_helpers.get_utc_now_datetime()
+        # Rolling a task back from done/feedback must clear the matching
+        # dates, otherwise stats keep counting the task as finished.
+        if new_status.is_feedback_request:
+            data["end_date"] = now
+        elif not new_status.is_done:
+            data["end_date"] = None
+        data["done_date"] = now if new_status.is_done else None
 
     task.update(data)
     clear_task_cache(task_id)
@@ -1511,17 +1561,6 @@ def get_or_create_status(
             is_wip=is_wip,
         )
         events.emit("task-status:new", {"task_status_id": task_status.id})
-    return task_status.serialize()
-
-
-def update_task_status(task_status_id, data):
-    """
-    Update task status data with given task_id.
-    """
-    task_status = get_task_status_raw(task_status_id)
-    task_status.update(data)
-    clear_task_status_cache(task_status_id)
-    events.emit("task-status:update", {"task_status_id": task_status_id})
     return task_status.serialize()
 
 
@@ -1653,33 +1692,6 @@ def delete_time_spent(task_id, person_id, date):
     return time_spent.serialize()
 
 
-def is_finished(task, data):
-    """
-    Return True if task status is set to feedback request.
-    """
-    if "task_status_id" in data:
-        task_status = get_task_status_raw(task.task_status_id)
-        new_task_status = get_task_status_raw(data["task_status_id"])
-        return (
-            new_task_status.id != task_status.id
-            and new_task_status.is_feedback_request
-        )
-    else:
-        return False
-
-
-def is_done(task, data):
-    """
-    Return True if task status is set to done.
-    """
-    if "task_status_id" in data:
-        task_status = get_task_status_raw(task.task_status_id)
-        new_task_status = get_task_status_raw(data["task_status_id"])
-        return new_task_status.id != task_status.id and new_task_status.is_done
-    else:
-        return False
-
-
 def clear_assignation(task_id, person_id=None):
     """
     Clear task assignation and emit a *task:unassign* event.
@@ -1687,16 +1699,22 @@ def clear_assignation(task_id, person_id=None):
     task = get_task_raw(task_id)
     project_id = str(task.project_id)
 
-    removed_assignments = []
     if person_id is None:
         removed_assignments = [person.serialize() for person in task.assignees]
-        task.update({"assignees": []})
+        new_assignees = []
     else:
-        assignees = [
+        removed_assignments = [{"id": person_id}]
+        new_assignees = [
             person for person in task.assignees if str(person.id) != person_id
         ]
-        task.update({"assignees": assignees})
-        removed_assignments = [{"id": person_id}]
+
+    try:
+        task.update({"assignees": new_assignees})
+    except StaleDataError:
+        # A concurrent unassign already removed the link, so the desired state
+        # is already reached. task.update() has rolled back its own failed
+        # transaction, so there is nothing left to delete: treat it as cleared.
+        pass
 
     clear_task_cache(task_id)
     task_dict = task.serialize()
@@ -1717,7 +1735,8 @@ def assign_task(task_id, person_id, assigner_id=None):
     task = get_task_raw(task_id)
     project_id = str(task.project_id)
     person = persons_service.get_person_raw(person_id)
-    task.assignees.append(person)
+    if person not in task.assignees:
+        task.assignees.append(person)
     if assigner_id is not None:
         task.assigner_id = assigner_id
     task.save()
@@ -1852,7 +1871,7 @@ def add_preview_file_to_comment(comment_id, person_id, task_id, revision=None):
     events.emit(
         "comment:update", {"comment_id": comment.id}, project_id=project_id
     )
-    return preview_file.serialize()
+    return preview_file.serialize(relations=True)
 
 
 def update_preview_file_info(preview_file):
@@ -1900,7 +1919,7 @@ def get_tasks_for_project(
     Return all tasks for given project.
     """
     query = (
-        Task.query.options(selectinload(Task.assignees))
+        Task.query.options(selectinload(Task.assignees).load_only(Person.id))
         .filter(Task.project_id == project_id)
         .order_by(Task.updated_at.desc())
     )
@@ -1980,7 +1999,6 @@ def reset_tasks_data(project_id):
 
 
 def reset_task_data(task_id):
-    clear_task_cache(task_id)
     task = Task.get(task_id)
     retake_count = 0
     real_start_date = None
@@ -2045,6 +2063,9 @@ def reset_task_data(task_id):
             "task_status_id": task_status_id,
         }
     )
+    # Invalidate after the write, otherwise a concurrent read re-caches
+    # the stale row between the invalidation and the update.
+    clear_task_cache(task_id)
     project_id = str(task.project_id)
     events.emit(
         "task:update", {"task_id": str(task.id)}, project_id=project_id
@@ -2052,12 +2073,34 @@ def reset_task_data(task_id):
     return task.serialize(relations=True)
 
 
-def get_persons_tasks_dates(project_id=None):
+def get_persons_tasks_dates(project_id=None, project_ids=None):
     """
     For schedule usages, for each active person, it returns the first start
     date of all tasks of assigned to this person and the last end date.
+
+    Scoping (project_id takes precedence over project_ids):
+    - project_id, when set, scopes the lookup to that single project and
+      nothing else. It is honoured directly -- including closed projects --
+      instead of being intersected with the open-project list, otherwise a
+      closed but legitimately accessible project would yield an empty result.
+      The caller is responsible for checking access to it.
+    - project_ids restricts the lookup to a set of projects. Only None (not an
+      empty list) triggers the studio-wide fallback below. An empty list is
+      honoured as-is and matches no project, which is how a manager with no
+      project gets an empty result -- the guard must stay an `is None` identity
+      test and never become `if not project_ids:`, otherwise such a manager
+      would leak the studio-wide view.
     """
-    project_ids = projects_service.open_project_ids()
+    if project_id is not None:
+        # An explicit, access-checked project scopes the lookup directly. This
+        # short-circuits the open-project fallback so a closed project the
+        # caller may legitimately see is not filtered out to an empty result.
+        project_ids = [project_id]
+    elif project_ids is None:
+        # Studio-wide fallback. Note this is the project-scoped helper, not
+        # user_service.get_open_project_ids() which is limited to the current
+        # user's projects.
+        project_ids = projects_service.open_project_ids()
     query = (
         Task.query.with_entities(
             Person.id, func.min(Task.start_date), func.max(Task.due_date)
@@ -2067,9 +2110,6 @@ def get_persons_tasks_dates(project_id=None):
         .group_by(Person.id)
         .join(Task.assignees)
     )
-
-    if project_id is not None:
-        query = query.filter(Task.project_id == project_id)
 
     return [
         {
@@ -2260,6 +2300,9 @@ def get_open_tasks(
             }
         )
         tasks.append(task_dict)
+
+    if tasks:
+        _attach_assignee_ids(tasks)
 
     result = {
         "data": [],

@@ -3,7 +3,7 @@ import orjson as json
 
 from flask import request, current_app
 from flask import send_file as flask_send_file
-from flask_restful import Resource
+from flask.views import MethodView
 from flask_jwt_extended import jwt_required
 from flask_fs.errors import FileNotFound
 from werkzeug.exceptions import NotFound
@@ -12,6 +12,7 @@ from zou.app import config
 from zou.app.mixin import ArgsMixin
 from zou.app.utils import validation as validation_utils
 from zou.app.blueprints.previews.schemas import (
+    AnnotationsUpdateSchema,
     ExtractAnnotatedFrameSchema,
     PreviewFileUploadSchema,
     PreviewFilePositionSchema,
@@ -254,6 +255,22 @@ class BaseNewPreviewFilePicture:
             "height": height,
         }
 
+    @staticmethod
+    def _get_upload_stream_size(uploaded_file):
+        """
+        Return the byte size of the uploaded file stream, or None when the
+        stream is not seekable.
+        """
+        try:
+            stream = uploaded_file.stream
+            position = stream.tell()
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(position)
+            return size
+        except (AttributeError, OSError, ValueError):
+            return None
+
     def save_movie_preview(
         self, preview_file_id, uploaded_file, normalize=True
     ):
@@ -274,6 +291,15 @@ class BaseNewPreviewFilePicture:
                 "Uploaded movie could not be written to temporary storage "
                 "or is empty; aborting before dispatching normalization."
             )
+        expected_size = self._get_upload_stream_size(uploaded_file)
+        written_size = os.path.getsize(uploaded_movie_path)
+        if expected_size is not None and written_size != expected_size:
+            fs.rm_file(uploaded_movie_path)
+            raise PreviewProcessingFailedException(
+                f"Uploaded movie was only partially written to temporary "
+                f"storage ({written_size}/{expected_size} bytes); the "
+                f"temporary disk may be full."
+            )
         save_source_file = config.PREVIEW_SAVE_SOURCE_FILE
         if normalize and config.ENABLE_JOB_QUEUE and not no_job:
             queue_store.job_queue.enqueue(
@@ -285,6 +311,7 @@ class BaseNewPreviewFilePicture:
                     save_source_file,
                 ),
                 job_timeout=int(config.JOB_QUEUE_TIMEOUT),
+                on_failure=preview_files_service.mark_broken_on_job_failure,
             )
         else:
             preview_files_service.prepare_and_store_movie(
@@ -303,12 +330,15 @@ class BaseNewPreviewFilePicture:
         file_name = f"{instance_id}.{extension}"
         file_path = os.path.join(tmp_folder, file_name)
         uploaded_file.save(file_path)
-        file_store.add_file("previews", instance_id, file_path)
-        file_size = fs.get_file_size(file_path)
-        preview_files_service.update_preview_file(
-            instance_id, {"file_size": file_size}, silent=True
-        )
-        os.remove(file_path)
+        try:
+            file_store.add_file("previews", instance_id, file_path)
+            file_size = fs.get_file_size(file_path)
+            preview_files_service.update_preview_file(
+                instance_id, {"file_size": file_size}, silent=True
+            )
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
         return file_path
 
     def emit_app_preview_event(self, preview_file_id):
@@ -425,7 +455,7 @@ class BaseNewPreviewFilePicture:
 
 
 class CreatePreviewFilePictureResource(
-    BaseNewPreviewFilePicture, Resource, ArgsMixin
+    BaseNewPreviewFilePicture, MethodView, ArgsMixin
 ):
 
     @jwt_required()
@@ -601,7 +631,7 @@ class BaseBatchComment(BaseNewPreviewFilePicture, ArgsMixin):
         return new_comments, 201
 
 
-class AddTaskBatchCommentResource(BaseBatchComment, Resource):
+class AddTaskBatchCommentResource(BaseBatchComment, MethodView):
 
     @jwt_required()
     def post(self, task_id):
@@ -648,7 +678,7 @@ class AddTaskBatchCommentResource(BaseBatchComment, Resource):
         return self.process_comments(task_id)
 
 
-class AddTasksBatchCommentResource(BaseBatchComment, Resource):
+class AddTasksBatchCommentResource(BaseBatchComment, MethodView):
 
     @jwt_required()
     def post(self):
@@ -686,13 +716,13 @@ class AddTasksBatchCommentResource(BaseBatchComment, Resource):
         return self.process_comments()
 
 
-class BasePreviewFileResource(Resource):
+class BasePreviewFileResource(MethodView):
     """
     Base class to download a preview file.
     """
 
     def __init__(self):
-        Resource.__init__(self)
+        MethodView.__init__(self)
         self.preview_file = None
         self.last_modified = None
 
@@ -996,10 +1026,10 @@ class PreviewFileDownloadResource(BasePreviewFileResource):
             raise PreviewFileNotFoundException
 
 
-class AttachmentThumbnailResource(Resource):
+class AttachmentThumbnailResource(MethodView):
 
     def __init__(self):
-        Resource.__init__(self)
+        MethodView.__init__(self)
         self.attachment_file = None
 
     def is_allowed(self, attachment_id):
@@ -1129,6 +1159,7 @@ class BasePreviewFileThumbnailResource(BasePreviewPictureResource):
         )
         task = tasks_service.get_task(self.preview_file["task_id"])
         entity = entities_service.get_entity(task["entity_id"])
+        user_service.resolve_project_role(task["project_id"])
         if (
             entity["preview_file_id"] != preview_file_id
             or not entity["is_shared"]
@@ -1171,7 +1202,7 @@ class PreviewFileOriginalResource(BasePreviewFileThumbnailResource):
         BasePreviewPictureResource.__init__(self, "original")
 
 
-class BaseThumbnailResource(Resource):
+class BaseThumbnailResource(MethodView):
     """
     Base class to post and get a thumbnail.
     """
@@ -1183,7 +1214,7 @@ class BaseThumbnailResource(Resource):
         update_model_func,
         size=thumbnail_utils.RECTANGLE_SIZE,
     ):
-        Resource.__init__(self)
+        MethodView.__init__(self)
         self.data_type = data_type
         self.get_model_func = get_model_func
         self.update_model_func = update_model_func
@@ -1249,8 +1280,6 @@ class BaseThumbnailResource(Resource):
         self.is_exist(instance_id)
         self.check_allowed_to_post(instance_id)
 
-        self.prepare_creation(instance_id)
-
         if "file" not in request.files:
             raise WrongParameterException("File not provided.")
 
@@ -1259,11 +1288,19 @@ class BaseThumbnailResource(Resource):
         thumbnail_path = thumbnail_utils.save_file(
             tmp_folder, instance_id, uploaded_file
         )
-        thumbnail_path = thumbnail_utils.turn_into_thumbnail(
-            thumbnail_path, size=self.size
-        )
-        file_store.add_picture("thumbnails", instance_id, thumbnail_path)
-        os.remove(thumbnail_path)
+        try:
+            thumbnail_path = thumbnail_utils.turn_into_thumbnail(
+                thumbnail_path, size=self.size
+            )
+            file_store.add_picture("thumbnails", instance_id, thumbnail_path)
+        finally:
+            if os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+
+        # Mark the avatar as present only once the thumbnail is stored, so a
+        # missing/invalid file or a storage failure cannot leave has_avatar
+        # set with no picture behind it (which would 404 every read).
+        self.prepare_creation(instance_id)
         preview_files_service.clear_variant_from_cache(
             instance_id, "thumbnails"
         )
@@ -1387,7 +1424,7 @@ class CreateProjectThumbnailResource(ProjectThumbnailResource):
         return user_service.check_manager_project_access(instance_id)
 
 
-class SetMainPreviewResource(Resource, ArgsMixin):
+class SetMainPreviewResource(MethodView, ArgsMixin):
     """
     Set given preview as main preview of the related entity. This preview will
     be used to illustrate the entity.
@@ -1445,6 +1482,10 @@ class SetMainPreviewResource(Resource, ArgsMixin):
         task = tasks_service.get_task(preview_file["task_id"])
         user_service.check_project_access(task["project_id"])
         user_service.check_entity_access(task["entity_id"])
+        # Clients review content but must not redefine how an entity is
+        # illustrated.
+        if permissions.has_client_permissions():
+            raise permissions.PermissionDenied
         if frame_number is not None:
             if preview_file["extension"] != "mp4":
                 raise WrongParameterException(
@@ -1460,7 +1501,7 @@ class SetMainPreviewResource(Resource, ArgsMixin):
         return entity
 
 
-class UpdatePreviewPositionResource(Resource, ArgsMixin):
+class UpdatePreviewPositionResource(MethodView, ArgsMixin):
     """
     Allow to change orders of previews for a single revision.
     """
@@ -1521,7 +1562,7 @@ class UpdatePreviewPositionResource(Resource, ArgsMixin):
         )
 
 
-class UpdateAnnotationsResource(Resource, ArgsMixin):
+class UpdateAnnotationsResource(MethodView, ArgsMixin):
 
     @jwt_required()
     def put(self, preview_file_id):
@@ -1611,21 +1652,19 @@ class UpdateAnnotationsResource(Resource, ArgsMixin):
         if not (is_manager or is_client or is_supervisor_allowed):
             raise permissions.PermissionDenied
 
-        additions = request.json.get("additions", [])
-        updates = request.json.get("updates", [])
-        deletions = request.json.get("deletions", [])
+        body = validation_utils.validate_request_body(AnnotationsUpdateSchema)
         user = persons_service.get_current_user()
         return preview_files_service.update_preview_file_annotations(
             user["id"],
             task["project_id"],
             preview_file_id,
-            additions=additions,
-            updates=updates,
-            deletions=deletions,
+            additions=body.additions,
+            updates=body.updates,
+            deletions=body.deletions,
         )
 
 
-class RunningPreviewFiles(Resource, ArgsMixin):
+class RunningPreviewFiles(MethodView, ArgsMixin):
     """
     Retrieve all preview files from open productions with states equals
     to processing or broken
@@ -1697,7 +1736,7 @@ class RunningPreviewFiles(Resource, ArgsMixin):
         )
 
 
-class ExtractFrameFromPreview(Resource, ArgsMixin):
+class ExtractFrameFromPreview(MethodView, ArgsMixin):
     """
     Extract the current frame of the preview
     """
@@ -1759,7 +1798,7 @@ class ExtractFrameFromPreview(Resource, ArgsMixin):
             os.remove(extracted_frame_path)
 
 
-class ExtractAnnotatedFrameFromPreview(Resource):
+class ExtractAnnotatedFrameFromPreview(MethodView):
     """
     Extract a frame (movie) or the picture itself, with its matching
     annotation rendered on top.
@@ -1862,7 +1901,7 @@ def _serve_annotated_frames_bundle(
         os.remove(bundle_path)
 
 
-class ExtractAllAnnotatedFramesFromPreview(Resource):
+class ExtractAllAnnotatedFramesFromPreview(MethodView):
     """
     Build a zip archive containing every annotated frame (movie) or
     every annotated copy of the picture preview.
@@ -1910,7 +1949,7 @@ class ExtractAllAnnotatedFramesFromPreview(Resource):
         )
 
 
-class ExtractAllAnnotatedFramesAsPdfFromPreview(Resource):
+class ExtractAllAnnotatedFramesAsPdfFromPreview(MethodView):
     """
     Build a multi-page PDF containing every annotated frame (movie) or
     every annotated copy of the picture preview.
@@ -1958,7 +1997,7 @@ class ExtractAllAnnotatedFramesAsPdfFromPreview(Resource):
         )
 
 
-class ExtractTileFromPreview(Resource):
+class ExtractTileFromPreview(MethodView):
     """
     Extract a tile from a preview_file
     """
@@ -2009,7 +2048,7 @@ class ExtractTileFromPreview(Resource):
             os.remove(extracted_tile_path)
 
 
-class CreatePreviewBackgroundFileResource(Resource):
+class CreatePreviewBackgroundFileResource(MethodView):
     """
     Main resource to add a preview background file. It stores the preview background
     file and generates a rectangle thumbnail.
@@ -2183,7 +2222,7 @@ class CreatePreviewBackgroundFileResource(Resource):
         )
 
 
-class PreviewBackgroundFileResource(Resource):
+class PreviewBackgroundFileResource(MethodView):
     """
     Main resource to download a preview background file.
     """

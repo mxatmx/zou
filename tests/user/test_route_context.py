@@ -520,6 +520,17 @@ class UserContextRoutesTestCase(ApiDBTestCase):
         )
         self.assertTrue(self.user_id in recipients)
 
+        subscribed_path = (
+            f'/data/user/sequences/{self.sequence_dict["id"]}'
+            f'/task-types/{self.task_type_dict["id"]}/subscribed'
+        )
+        self.assertTrue(self.get(subscribed_path))
+        deprecated_path = (
+            f'/data/user/entities/{self.sequence_dict["id"]}'
+            f'/task-types/{self.task_type_dict["id"]}/subscribed'
+        )
+        self.assertTrue(self.get(deprecated_path))
+
     def test_unsubscribe_sequence(self):
         path = f'/actions/user/sequences/{self.sequence_dict["id"]}/task-types/{self.task_type_dict["id"]}/'
         self.post(path + "subscribe", {})
@@ -855,3 +866,26 @@ class UserContextRoutesTestCase(ApiDBTestCase):
 
     def create_test_folder(self):
         return super().create_test_folder()
+
+
+class UserContextProjectRolesTestCase(ApiDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.generate_fixture_project_status()
+        self.generate_fixture_project()
+        self.user_id = self.user["id"]
+        projects_service.add_team_member(str(self.project.id), self.user_id)
+
+    def test_context_exposes_explicit_project_roles(self):
+        projects_service.update_team_member_role(
+            str(self.project.id), self.user_id, "supervisor"
+        )
+        context = self.get("data/user/context")
+        self.assertEqual(
+            context["project_roles"],
+            {str(self.project.id): "supervisor"},
+        )
+
+    def test_context_project_roles_empty_when_inherited(self):
+        context = self.get("data/user/context")
+        self.assertEqual(context["project_roles"], {})

@@ -16,6 +16,7 @@ from zou.app.models.project import (
 )
 from zou.app.models.project_status import ProjectStatus
 from zou.app.models.status_automation import StatusAutomation
+from zou.app.models.task import Task
 from zou.app.models.task_type import TaskType
 from zou.app.models.task_status import TaskStatus
 from zou.app.models.department import Department
@@ -33,6 +34,7 @@ from zou.app.services.exception import (
 )
 
 from zou.app.utils import fields, events, cache
+from zou.app import db
 
 from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import joinedload
@@ -222,6 +224,7 @@ def _serialize_descriptor(descriptor):
         "choices": descriptor.choices,
         "for_client": descriptor.for_client or False,
         "entity_type": descriptor.entity_type,
+        "task_type_id": fields.serialize_value(descriptor.task_type_id),
         "position": descriptor.position,
         "departments": [
             str(department.id) for department in descriptor.departments
@@ -417,11 +420,21 @@ def update_project(project_id, data):
     return project.serialize()
 
 
-def add_team_member(project_id, person_id):
+def add_team_member(project_id, person_id, role=None):
     """
-    Add a person listed in database to the the project team.
+    Add a person listed in database to the project team, with an optional
+    project-specific role. The role is validated before the membership is
+    created so an invalid role leaves no partial state behind.
     """
-    return _add_to_list_attr(project_id, Person, person_id, "team")
+    if role == "admin":
+        raise WrongParameterException(
+            "admin is a global role and cannot be set per project"
+        )
+    project = _add_to_list_attr(project_id, Person, person_id, "team")
+    if role is not None:
+        update_team_member_role(project_id, person_id, role)
+        project = get_project_raw(project_id).serialize()
+    return project
 
 
 def remove_team_member(project_id, person_id):
@@ -429,6 +442,50 @@ def remove_team_member(project_id, person_id):
     Remove a person listed in database from the the project team.
     """
     return _remove_from_list_attr(project_id, Person, person_id, "team")
+
+
+def update_team_member_role(project_id, person_id, role):
+    """
+    Set the role of given person on given project. A None role restores
+    inheritance of the person's global role.
+    """
+    if role == "admin":
+        raise WrongParameterException(
+            "admin is a global role and cannot be set per project"
+        )
+    link = ProjectPersonLink.query.filter_by(
+        project_id=project_id, person_id=person_id
+    ).first()
+    if link is None:
+        raise WrongParameterException(
+            "Person is not a member of the project team"
+        )
+    link.role = role
+    db.session.commit()
+    clear_project_cache(str(project_id))
+    events.emit("project:update", {}, project_id=str(project_id))
+    return {
+        "project_id": str(link.project_id),
+        "person_id": str(link.person_id),
+        "role": (
+            getattr(link.role, "code", link.role)
+            if link.role is not None
+            else None
+        ),
+    }
+
+
+def get_team_roles(project_id):
+    """
+    Return a dict mapping person ids to their explicit role on given
+    project. Persons inheriting their global role are absent from the dict.
+    """
+    return {
+        str(link.person_id): getattr(link.role, "code", link.role)
+        for link in ProjectPersonLink.query.filter_by(
+            project_id=project_id
+        ).filter(ProjectPersonLink.role.isnot(None))
+    }
 
 
 def add_asset_type_setting(project_id, asset_type_id):
@@ -495,6 +552,72 @@ def remove_task_status_setting(project_id, task_status_id):
     return _remove_from_list_attr(
         project_id, TaskStatus, task_status_id, "task_statuses"
     )
+
+
+def update_project_settings(
+    project_id,
+    task_types=None,
+    task_status_ids=None,
+    asset_type_ids=None,
+    replace_task_types=False,
+):
+    """
+    Add several task types (with their priority), task statuses and asset
+    types to the project settings in a single operation. Unknown ids are
+    skipped. When replace_task_types is set, the given task type list is the
+    full wanted set: existing links absent from it are removed.
+    """
+    project = get_project_raw(project_id)
+    project_id = str(project.id)
+
+    wanted_task_types = {}
+    for entry in task_types or []:
+        wanted_task_types[str(entry["task_type_id"])] = entry.get("priority")
+
+    existing_links = {
+        str(link.task_type_id): link
+        for link in ProjectTaskTypeLink.query.filter_by(project_id=project_id)
+    }
+    for task_type_id, priority in wanted_task_types.items():
+        link = existing_links.get(task_type_id)
+        if link is None:
+            if TaskType.get(task_type_id) is not None:
+                ProjectTaskTypeLink.create(
+                    task_type_id=task_type_id,
+                    project_id=project_id,
+                    priority=priority,
+                )
+        elif priority is not None and link.priority != priority:
+            link.update({"priority": priority})
+    if replace_task_types:
+        for task_type_id, link in existing_links.items():
+            if task_type_id not in wanted_task_types:
+                task_type = TaskType.get(task_type_id)
+                if task_type is not None:
+                    project.task_types.remove(task_type)
+
+    task_status_map = {
+        str(status.id): status for status in project.task_statuses
+    }
+    for task_status_id in task_status_ids or []:
+        task_status = TaskStatus.get(task_status_id)
+        if (
+            task_status is not None
+            and str(task_status.id) not in task_status_map
+        ):
+            project.task_statuses.append(task_status)
+            task_status_map[str(task_status.id)] = task_status
+
+    asset_type_map = {
+        str(asset_type.id): asset_type for asset_type in project.asset_types
+    }
+    for asset_type_id in asset_type_ids or []:
+        asset_type = EntityType.get(asset_type_id)
+        if asset_type is not None and str(asset_type.id) not in asset_type_map:
+            project.asset_types.append(asset_type)
+            asset_type_map[str(asset_type.id)] = asset_type
+
+    return _save_project(project)
 
 
 def add_status_automation_setting(project_id, status_automation_id):
@@ -622,6 +745,16 @@ def _entity_query_for_descriptor_entity_type(descriptor):
     return query
 
 
+def _task_query_for_descriptor(descriptor):
+    """
+    Tasks whose `data` may hold values for this Task descriptor.
+    """
+    return Task.query.filter(
+        Task.project_id == descriptor.project_id,
+        Task.task_type_id == descriptor.task_type_id,
+    )
+
+
 def _strip_metadata_field_from_model_data(model, field_name):
     """
     Remove field_name from model.data when `data` is not null.
@@ -645,6 +778,16 @@ def _migrate_descriptor_field_rename(descriptor, new_field_name):
             use_no_commit=False,
         )
         return
+    if descriptor.entity_type == "Task":
+        for task in _task_query_for_descriptor(descriptor).all():
+            _migrate_metadata_field_name(
+                task,
+                descriptor.field_name,
+                new_field_name,
+                use_no_commit=True,
+            )
+        Task.commit()
+        return
     entities = _entity_query_for_descriptor_entity_type(descriptor).all()
     for entity in entities:
         _migrate_metadata_field_name(
@@ -665,6 +808,10 @@ def _remove_stored_values_for_metadata_descriptor(descriptor):
         project = get_project_raw(descriptor.project_id)
         _strip_metadata_field_from_model_data(project, descriptor.field_name)
         return
+    if descriptor.entity_type == "Task":
+        for task in _task_query_for_descriptor(descriptor).all():
+            _strip_metadata_field_from_model_data(task, descriptor.field_name)
+        return
     for entity in Entity.get_all_by(project_id=descriptor.project_id):
         _strip_metadata_field_from_model_data(entity, descriptor.field_name)
 
@@ -677,11 +824,13 @@ def add_metadata_descriptor(
     choices,
     for_client,
     departments=None,
+    task_type_id=None,
 ):
     """
     Register a custom field for the given `entity_type` in this project.
-    Values are stored in `Entity.data` (Asset, Shot, …) or in `Project.data`
-    when `entity_type` is ``Project``.
+    Values are stored in `Entity.data` (Asset, Shot, …), in `Project.data`
+    when `entity_type` is ``Project`` or in `Task.data` when it is
+    ``Task`` (scoped to `task_type_id`).
     """
     if not departments:
         departments = []
@@ -699,6 +848,7 @@ def add_metadata_descriptor(
         descriptor = MetadataDescriptor.create(
             project_id=project_id,
             entity_type=entity_type,
+            task_type_id=task_type_id,
             name=name,
             data_type=data_type,
             choices=choices,
@@ -850,6 +1000,158 @@ def remove_metadata_descriptor(metadata_descriptor_id):
     return descriptor.serialize()
 
 
+def add_metadata_descriptor_to_projects(
+    project_ids,
+    entity_type,
+    name,
+    data_type,
+    choices,
+    for_client,
+    departments=None,
+):
+    """
+    Create the same metadata descriptor in every given project that does not
+    already own one with the same field name and entity type. Returns the
+    list of created descriptors.
+    """
+    field_name = slugify.slugify(name, separator="_")
+    created = []
+    for project_id in project_ids:
+        exists = (
+            MetadataDescriptor.query.filter(
+                MetadataDescriptor.project_id == project_id,
+                MetadataDescriptor.entity_type == entity_type,
+                MetadataDescriptor.field_name == field_name,
+            ).count()
+            > 0
+        )
+        if not exists:
+            created.append(
+                add_metadata_descriptor(
+                    project_id,
+                    entity_type,
+                    name,
+                    data_type,
+                    choices,
+                    for_client,
+                    departments,
+                )
+            )
+    return created
+
+
+def copy_project_metadata_descriptors(project_id):
+    """
+    Copy the Project-scoped metadata descriptors (the all-projects columns)
+    owned by open projects onto the given project so that its cells are
+    editable right away. One copy per distinct field name; field names the
+    project already owns are left untouched. Returns the created descriptors.
+    """
+    descriptors = (
+        MetadataDescriptor.query.join(
+            Project, MetadataDescriptor.project_id == Project.id
+        )
+        .join(ProjectStatus, Project.project_status_id == ProjectStatus.id)
+        .filter(ProjectStatus.name.in_(("Active", "open", "Open")))
+        .filter(MetadataDescriptor.entity_type == "Project")
+        .filter(MetadataDescriptor.project_id != project_id)
+        .order_by(MetadataDescriptor.position, MetadataDescriptor.name)
+        .all()
+    )
+    owned_field_names = {
+        descriptor.field_name
+        for descriptor in MetadataDescriptor.query.filter(
+            MetadataDescriptor.project_id == project_id,
+            MetadataDescriptor.entity_type == "Project",
+        )
+    }
+    created = []
+    for descriptor in descriptors:
+        if descriptor.field_name in owned_field_names:
+            continue
+        owned_field_names.add(descriptor.field_name)
+        created.append(
+            add_metadata_descriptor(
+                project_id,
+                "Project",
+                descriptor.name,
+                descriptor.data_type,
+                descriptor.choices,
+                descriptor.for_client,
+                [str(department.id) for department in descriptor.departments],
+            )
+        )
+    return created
+
+
+def update_metadata_descriptor_on_projects(
+    project_ids, entity_type, field_name, changes
+):
+    """
+    Update every metadata descriptor sharing the given field name and entity
+    type across the given projects. Returns the list of updated descriptors.
+    """
+    descriptors = MetadataDescriptor.query.filter(
+        MetadataDescriptor.project_id.in_(project_ids),
+        MetadataDescriptor.entity_type == entity_type,
+        MetadataDescriptor.field_name == field_name,
+    ).all()
+    return [
+        update_metadata_descriptor(str(descriptor.id), dict(changes))
+        for descriptor in descriptors
+    ]
+
+
+def remove_metadata_descriptor_from_projects(
+    project_ids, entity_type, field_name
+):
+    """
+    Remove every metadata descriptor sharing the given field name and entity
+    type across the given projects. Returns the list of removed ids.
+    """
+    descriptors = MetadataDescriptor.query.filter(
+        MetadataDescriptor.project_id.in_(project_ids),
+        MetadataDescriptor.entity_type == entity_type,
+        MetadataDescriptor.field_name == field_name,
+    ).all()
+    removed_ids = []
+    for descriptor in descriptors:
+        descriptor_id = str(descriptor.id)
+        remove_metadata_descriptor(descriptor_id)
+        removed_ids.append(descriptor_id)
+    return removed_ids
+
+
+def reorder_metadata_descriptors_on_projects(
+    project_ids, entity_type, field_order
+):
+    """
+    Apply the same column order, given as a list of field names, on every
+    given project. Descriptors whose field name is not listed keep trailing
+    positions (handled by reorder_metadata_descriptors). Returns the list of
+    updated descriptors across all projects.
+    """
+    updated = []
+    for project_id in project_ids:
+        descriptors = MetadataDescriptor.query.filter(
+            MetadataDescriptor.project_id == project_id,
+            MetadataDescriptor.entity_type == entity_type,
+        ).all()
+        by_field = {desc.field_name: str(desc.id) for desc in descriptors}
+        ordered_ids = [
+            by_field[field_name]
+            for field_name in field_order
+            if field_name in by_field
+        ]
+        if ordered_ids:
+            updated.extend(
+                reorder_metadata_descriptors(
+                    project_id, entity_type, ordered_ids
+                )
+            )
+    return updated
+
+
 def is_tv_show(project):
     return project["production_type"] == "tvshow"
 
@@ -910,6 +1212,42 @@ def create_project_task_status_link(
         )
 
     return task_status_link.serialize()
+
+
+def set_project_task_type_link_priorities(project_id, task_type_ids):
+    """
+    Set the priority of the project's task type links from the given ordered
+    id list (priority = position, 1-based). Only existing links are touched,
+    so a reorder never creates links. Returns the updated links.
+    """
+    links = []
+    for priority, task_type_id in enumerate(task_type_ids, start=1):
+        link = ProjectTaskTypeLink.get_by(
+            project_id=project_id, task_type_id=task_type_id
+        )
+        if link is not None:
+            link.update({"priority": priority})
+            links.append(link.serialize())
+    clear_project_cache(project_id)
+    return links
+
+
+def set_project_task_status_link_priorities(project_id, task_status_ids):
+    """
+    Set the priority of the project's task status links from the given ordered
+    id list (priority = position, 1-based). Only the priority is updated, so
+    the board roles of each link are preserved. Returns the updated links.
+    """
+    links = []
+    for priority, task_status_id in enumerate(task_status_ids, start=1):
+        link = ProjectTaskStatusLink.get_by(
+            project_id=project_id, task_status_id=task_status_id
+        )
+        if link is not None:
+            link.update({"priority": priority})
+            links.append(link.serialize())
+    clear_project_cache(project_id)
+    return links
 
 
 def get_project_task_types(project_id):
