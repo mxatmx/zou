@@ -36,6 +36,40 @@ class AssetRoutesTestCase(ApiDBTestCase):
         result = self.get(f"/data/assets/{self.asset_id}/casting")
         self.assertIsInstance(result, list)
 
+    def test_asset_creation_permission_allows_team_member_only(self):
+        artist = self.generate_fixture_user_cg_artist()
+        self.project.team.append(Person.get(artist["id"]))
+        self.project.save()
+        Person.get(artist["id"]).update({"can_create_assets": True})
+
+        self.log_in_cg_artist()
+        created = self.post(
+            f"/data/projects/{self.project_id}/asset-types/{self.asset_type.id}/assets/new",
+            {
+                "name": "Artist asset",
+                "description": "",
+                "data": {},
+                "is_shared": False,
+                "source_id": None,
+            },
+        )
+        self.assertEqual(created["name"], "Artist asset")
+
+        vendor = self.generate_fixture_user_vendor()
+        Person.get(vendor["id"]).update({"can_create_assets": True})
+        self.log_in_vendor()
+        self.post(
+            f"/data/projects/{self.project_id}/asset-types/{self.asset_type.id}/assets/new",
+            {
+                "name": "Unlisted vendor asset",
+                "description": "",
+                "data": {},
+                "is_shared": False,
+                "source_id": None,
+            },
+            403,
+        )
+
     def test_update_asset_casting(self):
         result = self.put(
             f"/data/assets/{self.asset_id}/casting",

@@ -680,6 +680,29 @@ def has_manager_project_access(project_id):
     )
 
 
+def has_create_assets_project_access(project_id):
+    """
+    Return True for a manager or a team member explicitly allowed to create
+    assets. The explicit grant remains project-membership-bound, so it cannot
+    be used to create assets in productions the person cannot access.
+    """
+    return permissions.has_admin_permissions() or (
+        check_belong_to_project(project_id)
+        and (
+            permissions.has_manager_permissions()
+            or persons_service.get_current_user()["can_create_assets"]
+        )
+    )
+
+
+def check_create_assets_project_access(project_id):
+    """Raise PermissionDenied unless the current user may create assets."""
+    is_allowed = has_create_assets_project_access(project_id)
+    if not is_allowed:
+        raise permissions.PermissionDenied
+    return is_allowed
+
+
 def check_manager_project_access(project_id):
     """
     Return true if current user is a manager and has a task assigned for this

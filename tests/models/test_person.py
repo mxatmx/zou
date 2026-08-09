@@ -262,6 +262,22 @@ class PersonTestCase(ApiDBTestCase):
         self.assertEqual(data["first_name"], person_again["first_name"])
         self.put_404(f"data/persons/{fields.gen_uuid()}", data)
 
+    def test_update_person_asset_creation_permission(self):
+        person = self.get_first("data/persons")
+        updated = self.put(
+            f"data/persons/{person['id']}", {"can_create_assets": True}
+        )
+        self.assertTrue(updated["can_create_assets"])
+        self.assertTrue(Person.get(person["id"]).can_create_assets)
+
+    def test_person_cannot_grant_themselves_asset_creation_permission(self):
+        artist = self.generate_fixture_user_cg_artist()
+        self.log_in_cg_artist()
+        self.put(
+            f"data/persons/{artist['id']}", {"can_create_assets": True}
+        )
+        self.assertFalse(Person.get(artist["id"]).can_create_assets)
+
     def test_write_routes_never_return_secrets(self):
         person = self.get_first("data/persons")
         Person.get(person["id"]).update(

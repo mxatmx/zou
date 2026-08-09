@@ -277,6 +277,9 @@ class Person(db.Model, BaseMixin, SerializerMixin):
     data = db.Column(JSONB)
 
     role = db.Column(ChoiceType(ROLE_TYPES), default="user", nullable=False)
+    # This deliberately grants only asset creation; it is not a substitute for
+    # the broader manager role.
+    can_create_assets = db.Column(db.Boolean(), default=False, nullable=False)
     position = db.Column(ChoiceType(POSITION_TYPES), default="artist")
     seniority = db.Column(ChoiceType(SENIORITY_TYPES), default="mid")
     daily_salary = db.Column(db.Integer, default=0)

@@ -1022,7 +1022,7 @@ class NewAssetResource(MethodView, ArgsMixin):
         """
         body = validation.validate_request_body(NewAssetSchema)
 
-        user_service.check_manager_project_access(project_id)
+        user_service.check_create_assets_project_access(project_id)
         asset = assets_service.create_asset(
             project_id,
             asset_type_id,

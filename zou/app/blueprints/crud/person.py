@@ -623,6 +623,7 @@ class PersonResource(BaseModelResource, ArgsMixin):
             if not permissions.has_person_permissions():
                 data.pop("expiration_date", None)
             data.pop("role", None)
+            data.pop("can_create_assets", None)
             data.pop("departments", None)
             data.pop("active", None)
             data.pop("is_bot", None)
